@@ -409,7 +409,7 @@ static void freeMapChunk() {
 // classic 60 rows. mapChunkRowsCap is the live capacity.
 static int mapChunkRowsCap = MAP_CHUNK_ROWS;
 static bool acFetchedOnce = false;
-#define AC_POLL_MS 60000
+#define AC_POLL_MS 30000   // S3 v19: 30 s polls while the FLIGHT screen is shown (user request; was 60 s). Fetches only run on the FLIGHT screen (v16), so the extra TLS churn is bounded to viewing time; the failure backoff ladder scales from this base as before.
 static int acFailStreak = 0;              // v161N: failure backoff
 static uint32_t acIntervalMs = AC_POLL_MS;
 
@@ -442,6 +442,7 @@ static bool jsonNumField(const String& s, const char* key, int from, int to, dou
 // back. If the re-allocation fails the fetch simply retries next
 // minute without the escrow (degraded, not broken).
 #define TLS_RESERVE_BYTES 57344   // v162N: 56 KB (was 40 KB)
+static uint32_t lastTlsOkMs = 0;   // S3 v17: last successful TLS use (AIS connect / ADS-B 200)
 static void* tlsReserve = nullptr;
 static size_t tlsReserveBytes = 0;
 // v164N: one re-take path for every call site. The v163N lesson:
@@ -488,7 +489,13 @@ static bool fetchAircraftInner() {
   // until it has (aisLoop owns the socket; it reconnects ~20 s
   // later, gated on !acFetchBusy). Colour mode has the sea mask's
   // 38 KB back in the pool and needs no pause.
-  if (!colourMapActive()) {
+  // S3 v12: on THIS board the pause applies in colour mode too
+  // (the M5 v8.31 pattern). The 2026-11-20 AIS logs showed the
+  // fetch running beside the live stream shredding the DMA pool
+  // (dmaLargest 18,420 B with 60 KB free) until neither the AIS
+  // reconnect nor the reserve retake could run. One TLS stack at
+  // a time from now on; ships persist across the short gaps.
+  if (true) {
     aisPauseReq = true;
     uint32_t t0 = millis();
     while (aisPauseReq && millis() - t0 < 2000) delay(5);
@@ -535,6 +542,7 @@ static bool fetchAircraftInner() {
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     http.end(); return false;
   }
+  lastTlsOkMs = millis();   // S3 v17
   String body = http.getString();
   http.end();
   int acPos = body.indexOf("\"ac\":");
@@ -884,7 +892,7 @@ static bool   detailOpen = false;
 // keeps its own centre/zoom. AIS shares the Flight screen's map.
 #define MODE_COUNT 3
 static const int MODE_MAP[MODE_COUNT] = {0, 1, 1};   // APRS, Flight, AIS
-static int    screenMode = 0;              // 0 = APRS, 1 = Flight, 2 = AIS
+static int    screenMode = 1;              // 0 = APRS, 1 = Flight, 2 = AIS (S3 v22: boot on FLIGHT, user request)
 static double modeCenterLat[MODE_COUNT] = {0, 0, 0}, modeCenterLon[MODE_COUNT] = {0, 0, 0};
 static int    modeZoom[MODE_COUNT] = {0, 0, 0};
 static bool   listOpen = false;
@@ -2891,7 +2899,9 @@ static int barListX = 126;
 static int barStatusX = 168;
 static void layoutBar() {
   int x = 2;
-  for (int i = 0; i < 3; i++) {
+  static const int ORDER[3] = {1, 2, 0};   // S3 v22: FLIGHT, AIS, APRS (user request)
+  for (int k = 0; k < 3; k++) {
+    int i = ORDER[k];
     if ((cfgScreens >> i) & 1) { barTabX[i] = x; x += barTabW[i] + 2; }
     else barTabX[i] = -1;
   }
@@ -3107,6 +3117,138 @@ static float snapAcTrack[MAX_AC];              // heading as drawn (v78)
 static char snapSelAcFlight[12] = "";          // selection as drawn (v78)
 static bool snapDetailIsAc = false;
 
+// ---------------- aircraft trails (S3 v20, user request) ----------
+// A short history polyline behind each aircraft on the FLIGHT
+// screen, drawn length capped at ~56 px (about 1 cm on this
+// panel). One point per fetch, appended when the aircraft has
+// moved >= 250 m from the last stored point; 6 points = up to
+// ~3 min of history at the 30 s poll. Keyed by callsign (the
+// aircraft table is rebuilt every fetch, so indices are not
+// stable); slots are LRU-evicted. Same snapshot/repair pattern
+// as the APRS station trails (v184N).
+#define AC_TRAIL_SLOTS 24
+#define AC_TRAIL_PTS 6
+struct AcTrail {
+  char flight[12] = "";
+  uint8_t cnt = 0;
+  float lat[AC_TRAIL_PTS];
+  float lon[AC_TRAIL_PTS];
+  uint32_t lastMs = 0;
+};
+static AcTrail acTrails[AC_TRAIL_SLOTS];
+static int16_t snapAcTrailBox[MAX_AC][4];   // drawn trail bbox
+static int snapAcTrailCntD[MAX_AC];         // stored points as drawn
+static float snapAcTrailLat[MAX_AC], snapAcTrailLon[MAX_AC];   // newest stored point as drawn
+
+static AcTrail* acTrailOf(const char* flight, bool create) {
+  AcTrail* lru = nullptr; uint32_t lruMs = 0xFFFFFFFF;
+  for (int k = 0; k < AC_TRAIL_SLOTS; k++) {
+    if (acTrails[k].flight[0] && !strcmp(acTrails[k].flight, flight)) return &acTrails[k];
+    if (create) {
+      if (!acTrails[k].flight[0]) {
+        strncpy(acTrails[k].flight, flight, sizeof(acTrails[k].flight) - 1);
+        acTrails[k].flight[sizeof(acTrails[k].flight) - 1] = 0;
+        acTrails[k].cnt = 0;
+        return &acTrails[k];
+      }
+      if (acTrails[k].lastMs < lruMs) { lruMs = acTrails[k].lastMs; lru = &acTrails[k]; }
+    }
+  }
+  if (create && lru) {
+    strncpy(lru->flight, flight, sizeof(lru->flight) - 1);
+    lru->flight[sizeof(lru->flight) - 1] = 0;
+    lru->cnt = 0;
+    return lru;
+  }
+  return nullptr;
+}
+
+static bool acTrailStale(int i) {
+  if (!aircraft[i].flight[0]) return snapAcTrailCntD[i] > 0;
+  AcTrail* t = acTrailOf(aircraft[i].flight, false);
+  int cnt = t ? t->cnt : 0;
+  if (cnt != snapAcTrailCntD[i]) return true;
+  if (cnt > 0 && (t->lat[cnt - 1] != snapAcTrailLat[i] || t->lon[cnt - 1] != snapAcTrailLon[i])) return true;
+  return false;
+}
+
+// ---------------- stationary aircraft drop (S3 v21, user request)
+// Aircraft that do not move at all (parked, or a stale feed) sit
+// on the map forever because every fetch returns them again.
+// Track each callsign's position across fetches: within 50 m
+// for 3 consecutive fetches (~90 s at the 30 s poll) and the
+// aircraft is removed from the table (marker, trail, LIST and
+// detail all follow the table). It reappears as soon as a fetch
+// shows it somewhere else.
+#define AC_STILL_SLOTS 24
+struct AcStill {
+  char flight[12] = "";
+  float lat = 0, lon = 0;
+  uint8_t still = 0;
+  uint32_t lastMs = 0;
+};
+static AcStill acStill[AC_STILL_SLOTS];
+
+static void acDropStationary() {
+  uint32_t now = millis();
+  bool drop[MAX_AC] = {};
+  for (int i = 0; i < acCount; i++) {
+    if (!aircraft[i].flight[0]) continue;
+    AcStill* s = nullptr; AcStill* lru = nullptr; uint32_t lruMs = 0xFFFFFFFF;
+    for (int k = 0; k < AC_STILL_SLOTS; k++) {
+      if (acStill[k].flight[0] && !strcmp(acStill[k].flight, aircraft[i].flight)) { s = &acStill[k]; break; }
+      if (!acStill[k].flight[0]) { if (!lru) lru = &acStill[k]; }
+      else if (acStill[k].lastMs < lruMs) { lruMs = acStill[k].lastMs; lru = &acStill[k]; }
+    }
+    if (!s) {
+      s = lru; if (!s) continue;
+      strncpy(s->flight, aircraft[i].flight, sizeof(s->flight) - 1);
+      s->flight[sizeof(s->flight) - 1] = 0;
+      s->lat = (float)aircraft[i].lat; s->lon = (float)aircraft[i].lon;
+      s->still = 0; s->lastMs = now;
+      continue;
+    }
+    double dLat = (aircraft[i].lat - s->lat) * 111320.0;
+    double dLon = (aircraft[i].lon - s->lon) * 111320.0 * cos(aircraft[i].lat * DEG_TO_RAD);
+    if (dLat * dLat + dLon * dLon >= 50.0 * 50.0) {
+      s->lat = (float)aircraft[i].lat; s->lon = (float)aircraft[i].lon;
+      s->still = 0;
+    } else if (s->still < 255) s->still++;
+    s->lastMs = now;
+    if (s->still >= 3) drop[i] = true;
+  }
+  int w = 0;
+  for (int i = 0; i < acCount; i++) if (!drop[i]) { if (w != i) aircraft[w] = aircraft[i]; w++; }
+  if (w != acCount) {
+    Serial.printf("ADS-B: dropped %d stationary aircraft\n", acCount - w);
+    acCount = w;
+  }
+}
+
+static void acTrailsUpdate() {
+  uint32_t now = millis();
+  for (int i = 0; i < acCount; i++) {
+    if (!aircraft[i].flight[0]) continue;
+    AcTrail* t = acTrailOf(aircraft[i].flight, true);
+    if (!t) continue;
+    if (t->cnt > 0 && now - t->lastMs > 180000UL) t->cnt = 0;   // long gap: start fresh
+    if (t->cnt > 0) {
+      double dLat = (aircraft[i].lat - t->lat[t->cnt - 1]) * 111320.0;
+      double dLon = (aircraft[i].lon - t->lon[t->cnt - 1]) * 111320.0 * cos(aircraft[i].lat * DEG_TO_RAD);
+      if (dLat * dLat + dLon * dLon < 250.0 * 250.0) { t->lastMs = now; continue; }
+    }
+    if (t->cnt >= AC_TRAIL_PTS) {
+      memmove(&t->lat[0], &t->lat[1], sizeof(float) * (AC_TRAIL_PTS - 1));
+      memmove(&t->lon[0], &t->lon[1], sizeof(float) * (AC_TRAIL_PTS - 1));
+      t->cnt = AC_TRAIL_PTS - 1;
+    }
+    t->lat[t->cnt] = (float)aircraft[i].lat;
+    t->lon[t->cnt] = (float)aircraft[i].lon;
+    t->cnt++;
+    t->lastMs = now;
+  }
+}
+
 static void drawAircraft() {
   int px, py;
   for (int i = 0; i < acCount; i++) {
@@ -3119,13 +3261,42 @@ static void drawAircraft() {
     // triangle rotates with the track, so track must match too.
     if (skipUnchanged && snapAcPx[i] == px && snapAcPy[i] == py &&
         !strcmp(snapAcFlight[i], aircraft[i].flight) &&
-        snapAcTrack[i] == aircraft[i].track && sel == selBefore)
+        snapAcTrack[i] == aircraft[i].track && sel == selBefore &&
+        !acTrailStale(i))   // S3 v20: trail grew -> redraw
       continue;
     snapAcPx[i] = px; snapAcPy[i] = py;
     strncpy(snapAcFlight[i], aircraft[i].flight, sizeof(snapAcFlight[i]) - 1);
     snapAcFlight[i][sizeof(snapAcFlight[i]) - 1] = 0;
     snapAcTrack[i] = aircraft[i].track;
-    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;   // v172N: APRS orange (user request)
+    uint16_t col = sel ? TFT_YELLOW : TFT_GREEN;   // S3 v13: bright green (user trial; v10-v12 white)
+    // S3 v20: history trail behind the aircraft, drawn length
+    // capped at ~56 px (about 1 cm); the current position is the
+    // final point, stored points are walked newest -> oldest.
+    {
+      AcTrail* t = aircraft[i].flight[0] ? acTrailOf(aircraft[i].flight, false) : nullptr;
+      int tcnt = t ? t->cnt : 0;
+      snapAcTrailCntD[i] = tcnt;
+      if (tcnt > 0) { snapAcTrailLat[i] = t->lat[tcnt - 1]; snapAcTrailLon[i] = t->lon[tcnt - 1]; }
+      int bx0 = px, by0 = py, bx1 = px, by1 = py;
+      if (tcnt > 0) {
+        int cx = px, cy = py; float budget = 56.0f;
+        for (int k = tcnt - 1; k >= 0 && budget > 0; k--) {
+          int qx, qy;
+          if (!geoToPx(t->lat[k], t->lon[k], qx, qy)) break;
+          float dx = (float)(qx - cx), dy = (float)(qy - cy);
+          float seg = sqrtf(dx * dx + dy * dy);
+          if (seg < 1.0f) continue;
+          int ex = qx, ey = qy;
+          if (seg > budget) { ex = cx + (int)(dx * budget / seg); ey = cy + (int)(dy * budget / seg); }
+          G->drawLine(cx, cy, ex, ey, col);
+          if (ex < bx0) bx0 = ex; if (ex > bx1) bx1 = ex;
+          if (ey < by0) by0 = ey; if (ey > by1) by1 = ey;
+          budget -= seg; cx = qx; cy = qy;
+        }
+      }
+      snapAcTrailBox[i][0] = bx0; snapAcTrailBox[i][1] = by0;
+      snapAcTrailBox[i][2] = bx1; snapAcTrailBox[i][3] = by1;
+    }
     // small triangle pointing along the track, cyan like a radar plot
     float r = aircraft[i].track * (float)DEG_TO_RAD;
     float sn = sinf(r), cs = cosf(r);
@@ -3188,7 +3359,7 @@ static void drawShips() {
     snapShipUnder[i] = underway;
     strncpy(snapShipName[i], label, sizeof(snapShipName[i]) - 1);
     snapShipName[i][sizeof(snapShipName[i]) - 1] = 0;
-    uint16_t col = sel ? TFT_YELLOW : TFT_ORANGE;   // v172N: APRS orange (user request)
+    uint16_t col = sel ? TFT_YELLOW : TFT_CYAN;   // S3 v10: cyan (user trial; was APRS orange)
     if (underway) {
       // triangle pointing along the course over ground
       float r = ships[i].cog * (float)DEG_TO_RAD;
@@ -3308,7 +3479,7 @@ static void drawAcDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_ORANGE, 0x1082);   // v172N
+  G->setTextColor(TFT_GREEN, 0x1082);   // S3 v13: match the marker colour
   G->setCursor(16, 34);
   G->print(a.flight);
   G->setFont(&fonts::Font0);
@@ -3347,7 +3518,7 @@ static void drawShipDetail() {
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
   G->setCursor(288, 34); G->print("X");
-  G->setTextColor(TFT_ORANGE, 0x1082);   // v172N
+  G->setTextColor(TFT_CYAN, 0x1082);   // S3 v10: match the marker colour
   G->setCursor(16, 34);
   char title[28];
   if (s->name[0]) strncpy(title, s->name, sizeof(title) - 1);
@@ -3516,10 +3687,18 @@ static void repairMovedObjects() {
                 geoToPx(aircraft[i].lat, aircraft[i].lon, px, py) &&
                 py >= BAR_H + 4 && px == snapAcPx[i] && py == snapAcPy[i] &&
                 snapAcTrack[i] == aircraft[i].track;   // v78: rotated triangle is not "same"
-    if (same) continue;
+    // S3 v20: a trail that changed must be repainted even when
+    // the marker itself is unchanged.
+    bool trailStale = snapAcTrailCntD[i] > 0 &&
+        (!(i < acCount) || acTrailStale(i));
+    if (same && !trailStale) continue;
     int w = (int)strlen(snapAcFlight[i]) * 6 + 16;
     repairErased = true;
-    restoreMapRect(snapAcPx[i] - 13, snapAcPy[i] - 13, snapAcPx[i] + w, snapAcPy[i] + 13);
+    if (!same)
+      restoreMapRect(snapAcPx[i] - 13, snapAcPy[i] - 13, snapAcPx[i] + w, snapAcPy[i] + 13);
+    if (snapAcTrailCntD[i] > 0)
+      restoreMapRect(snapAcTrailBox[i][0] - 2, snapAcTrailBox[i][1] - 2,
+                     snapAcTrailBox[i][2] + 2, snapAcTrailBox[i][3] + 2);
   }
   for (int i = 0; i < MAX_SHIPS; i++) {
     if (snapShipPx[i] < 0) continue;
@@ -4630,7 +4809,11 @@ static bool aisConnect() {
   // Two consecutive no-reserve failures switch back to freeing
   // the reserve (the pre-v166N behaviour) for good.
   if (tlsReserveBytes >= TLS_RESERVE_BYTES) { aisUseReserve = false; aisNoResFails = 0; }   // v170N
-  bool useRes = aisUseReserve;
+  // S3 v17: when the ambient hole is hopeless anyway (< 40 KB),
+  // skip the two doomed no-reserve attempts (15 s apart in the
+  // 2026-11-20 log) and use the reserve at once.
+  bool useRes = aisUseReserve
+    || heap_caps_get_largest_free_block(MALLOC_CAP_DMA) < 40960;
   if (useRes && tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
   wsInflateReleasePair();
   bool ok = aisConnectDo();
@@ -4698,6 +4881,7 @@ static bool aisConnectDo() {
   wsBuf = ""; wsMsg = ""; wsMsgStarted = false;
   wsInflateReset();
   sendAisSubscription();
+  lastTlsOkMs = millis();   // S3 v17
   Serial.println("AIS connected");
   return true;
 }
@@ -4710,6 +4894,20 @@ static void aisLoop() {
       Serial.println("AIS paused for ADS-B fetch (line mode)");
     }
     aisPauseReq = false;
+  }
+  // S3 v16 (user idea, corrected reading): the AIS screen is not
+  // the one on display - run no stream. TLS work happens only
+  // for the screen the user is actually looking at.
+  if (screenMode != 2) {
+    if (aisSockUp) { aisStopReq = true; aisSockUp = false; aisOnline = false; aisSubConfirmed = false; }
+    return;
+  }
+  // S3 v15 (user idea): the AIS screen is not among the portal's
+  // selected screens - run no stream at all. Every TLS consumer
+  // switched off is heap churn that never happens.
+  if (!(cfgScreens & 4)) {
+    if (aisSockUp) { aisStopReq = true; aisSockUp = false; aisOnline = false; aisSubConfirmed = false; }
+    return;
   }
   if (cfgAisKey.length() < 10) return;   // no key set: AIS screen stays empty
   if (WiFi.status() != WL_CONNECTED) {
@@ -4779,6 +4977,10 @@ static void switchMode(int m) {
   // v116: centre and zoom are SHARED by all screens (one map, one
   // view) - switching tabs changes only the objects drawn.
   screenMode = m;
+  // S3 v16: arriving on a screen starts its update at once
+  // instead of waiting out the interval / retry backoff.
+  if (m == 1) lastAcFetchMs = 0;
+  if (m == 2) aisNextTryMs = 0;
   curMap = MODE_MAP[m];
   selected = -1;
   selAcFlight[0] = 0;
@@ -5082,7 +5284,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer S3 v9");
+  tft.print("APRS Map Viewer S3 v22");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -5144,9 +5346,12 @@ void setup() {
   if (forcePortal) loadSettings(true);
   // v175N: if the startup screen is hidden by the portal's screen
   // selection, open on the first visible screen instead.
-  if (!((cfgScreens >> screenMode) & 1))
-    for (int i = 0; i < MODE_COUNT; i++)
-      if ((cfgScreens >> i) & 1) { screenMode = i; break; }
+  // S3 v22: "first visible" follows the tab order FLIGHT, AIS, APRS.
+  if (!((cfgScreens >> screenMode) & 1)) {
+    static const int ORDER[3] = {1, 2, 0};
+    for (int k = 0; k < MODE_COUNT; k++)
+      if ((cfgScreens >> ORDER[k]) & 1) { screenMode = ORDER[k]; break; }
+  }
   curMap = MODE_MAP[screenMode];
   wifiPhase(forcePortal);
 
@@ -5183,32 +5388,25 @@ void setup() {
   // never take big blocks before Wi-Fi). If only one half fits,
   // it becomes a permanent single chunk; if none fit, drawMap
   // keeps its dynamic fallback.
+  // S3 v11: the two-buffer compose is GONE. The AIS log of
+  // 2026-11-20 showed the DMA pool fragmenting over reconnect
+  // cycles until dmaLargest fell to 32,756 B and even the TLS
+  // reserve retake FAILED - the AIS handshake could no longer
+  // run at all. One permanent 120-row buffer frees 76,800 B for
+  // good; the map compose falls back to band pushes.
+  // S3 v18: 120 -> 60 rows. The reserve is structurally consumed
+  // by the AIS session it enables (the session lives inside the
+  // freed hole), so on this board the AMBIENT pool has to serve
+  // the next handshake - and it was ~38 KB short of the 028's
+  // working point. Another 38,400 B back: compose in 4 bands.
   {
-    static const int splits[3] = { 120, 144, 152 };
-    for (int si = 0; si < 3 && !mapChunk2; si++) {
-      int a = splits[si], b = 240 - a;
-      mapChunk = (uint16_t*)heap_caps_malloc(320 * a * sizeof(uint16_t),
-                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-      if (!mapChunk) continue;
-      mapChunk2 = (uint16_t*)heap_caps_malloc(320 * b * sizeof(uint16_t),
-                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-      if (mapChunk2) {
-        mapSplitRow = a;
-        mapChunkRowsCap = a;
-        mapChunkPermanent = true;
-        Serial.printf("frame buffers: permanent %d+%d rows, largest DMA now %u\n",
-                      a, b, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-      } else {
-        free(mapChunk); mapChunk = nullptr;
-      }
-    }
     if (!mapChunk2) {
-      mapChunk = (uint16_t*)heap_caps_malloc(320 * 120 * sizeof(uint16_t),
+      mapChunk = (uint16_t*)heap_caps_malloc(320 * 60 * sizeof(uint16_t),
                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
       if (mapChunk) {
-        mapChunkRowsCap = 120;
+        mapChunkRowsCap = 60;
         mapChunkPermanent = true;
-        Serial.printf("frame buffer: permanent single 120 rows, largest DMA now %u\n",
+        Serial.printf("frame buffer: permanent single 60 rows, largest DMA now %u\n",
                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
       } else {
         Serial.printf("frame buffer: alloc FAILED (largest DMA %u) - dynamic fallback\n",
@@ -5227,12 +5425,44 @@ void loop() {
   aisLoop();
   touchLoop();
   uint32_t now = millis();
-  if ((!acFetchedOnce || now - lastAcFetchMs > acIntervalMs) && WiFi.status() == WL_CONNECTED) {
+  // S3 v15 (user idea): no ADS-B fetches while the FLIGHT screen
+  // is not among the portal's selected screens.
+  // S3 v16: and only while the FLIGHT screen is on display.
+  if ((cfgScreens & 2) && screenMode == 1 && (!acFetchedOnce || now - lastAcFetchMs > acIntervalMs) && WiFi.status() == WL_CONNECTED) {
     lastAcFetchMs = now;
     acFetchedOnce = true;
     acFetchReq = true;   // v104: fetched on Core 0, touch stays live
   }
-  if (acDataReady) { acDataReady = false; stationsDirty = true; }
+  if (acDataReady) { acDataReady = false; acDropStationary(); acTrailsUpdate(); stationsDirty = true; }   // S3 v20: trail points per fetch; S3 v21: stationary drop first
+  // S3 v14: heap-death self-recovery. On this board the pool
+  // fragments over TLS cycles until the largest block sits at
+  // 32,756 B - 12 B below the smallest reserve size (32,768) -
+  // and every handshake fails forever (2026-11-20 v13 log:
+  // reserveBytes 0, 'tls reserve: FAILED' on every retry).
+  // Nothing in-process can defragment that, so when the reserve
+  // is gone AND no handshake-sized hole has existed for 10
+  // straight minutes, reboot: the heap is pristine at boot and
+  // everything reconnects. A healthy device never meets both
+  // conditions at once.
+  {
+    static uint32_t heapDeadSince = 0;
+    // S3 v17: "dead" must mean TLS is actually unusable - the
+    // reserve is spent and the hole is small WHILE a stream is
+    // up is a healthy state (v16 log: connected, ships flowing,
+    // 'tls reserve: FAILED'), so exclude aisOnline and require
+    // 10 min without any TLS success.
+    bool heapDead = !tlsReserve && !aisOnline &&
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < 40960 &&
+      now - lastTlsOkMs > 600000UL;
+    if (heapDead && WiFi.status() == WL_CONNECTED) {
+      if (!heapDeadSince) heapDeadSince = now;
+      else if (now - heapDeadSince > 300000UL) {   // S3 v18: 10 -> 5 min
+        Serial.println("heap dead (no reserve, largest < 40K for 10 min) - rebooting");
+        delay(50);
+        ESP.restart();
+      }
+    } else heapDeadSince = 0;
+  }
   // NTP clock for the persisted station timestamps
   if (!ntpStarted && WiFi.status() == WL_CONNECTED) {
     configTime(0, 0, "pool.ntp.org", "ntp.nict.jp");

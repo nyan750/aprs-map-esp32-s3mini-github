@@ -2144,8 +2144,10 @@ static void computeView() {
   // v171N: FOUR steps again (user request): x0.5 / x1.0 / x1.5 /
   // x2.0, driven by the [-] [+] buttons (the v117 two-step ZOOM
   // toggle is retired).
-  static const double APRS_SCALES[4] = {0.5, 1.0, 1.5, 2.0};
-  int li = zoomLevel; if (li < 0) li = 0; if (li > 3) li = 3;
+  // S3 v9 (= 028 v186N): SIX steps (user request): x2.5 and
+  // x3.0 added.
+  static const double APRS_SCALES[6] = {0.5, 1.0, 1.5, 2.0, 2.5, 3.0};
+  int li = zoomLevel; if (li < 0) li = 0; if (li > 5) li = 5;
   double s = APRS_SCALES[li];
   vScale = s;
   vSrcW = 320.0 / s; if (vSrcW > w) vSrcW = w;
@@ -2183,7 +2185,7 @@ static bool geoToPx(double lat, double lon, int& px, int& py) {
 // Startup/reset zoom: the whole map fitted to the screen (level 0), so
 // the whole map is what you see first. Zoom in with [+] / station taps.
 static int maxZoomLevel() {
-  return 3;   // v171N: four steps (x0.5 .. x2.0)
+  return 5;   // S3 v9 (= 028 v186N): six steps (x0.5 .. x3.0)
 }
 static int defaultZoomLevel() {
   return 0;   // v171N: every screen opens at x0.5 (user request)
@@ -3670,6 +3672,7 @@ static void redraw() {
   bool viewChanged = centerLat != lastViewLat || centerLon != lastViewLon
                   || zoomLevel != lastViewZoom || curMap != lastViewMap;
   bool mapRedrawn = false;
+  bool barRepair = false;   // S3 v8 (= 028 v187N): tap ring overlapped the bar
   repairErased = false;
   if (mapDirty || viewChanged) {
     if (chunkMutex) xSemaphoreTake(chunkMutex, portMAX_DELAY);
@@ -3694,6 +3697,12 @@ static void redraw() {
       restoreMapRect(tapX - 12, tapY - 12, tapX + 12, tapY + 12);
       markerRepair = false;
       repairErased = true;   // the tap ring may have clipped a marker
+      // S3 v8 (= 028 v187N): restoreMapRect only repaints the map
+      // area (y >= BAR_H), so a ring drawn over the bar itself -
+      // a tap on [+] / [-] / a tab / LIST - was never erased and
+      // stayed as a yellow ghost on the button. Force a full bar
+      // repaint below when the ring touched the bar.
+      if (tapY < BAR_H + 12) barRepair = true;
     }
     // v173N: left-edge cleanup (user report: label fragments
     // sometimes remain at the left edge, on APRS and on AIS).
@@ -3713,7 +3722,7 @@ static void redraw() {
   // must be repainted; on a marker-only update the bar is untouched
   // on screen, so leave it to drawBarF's own change check instead of
   // forcing a full-bar blink on every update.
-  if (mapRedrawn) drawBarF(true, false);
+  if (mapRedrawn || barRepair) drawBarF(true, false);
   else drawBarF(false, false);
   drawHomeMarker();
   if (screenMode == 0) drawStations();
@@ -5073,7 +5082,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer S3 v7");
+  tft.print("APRS Map Viewer S3 v9");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would

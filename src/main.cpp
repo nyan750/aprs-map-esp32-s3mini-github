@@ -40,17 +40,24 @@ LGFX tft;
 
 // ---------------- settings (phone setup portal, Plane Radar style) ----
 // config.h holds only the factory defaults; the live settings are kept
-// in NVS and edited from a phone browser (captive portal on the
-// "APRSMap-Setup" AP, or http://aprs-map.local / the device IP on LAN).
+// in NVS and edited from a phone browser. First-time setup (or a BOOT
+// reset) uses the captive portal on the "APRSMap-Setup" AP. S3 v24
+// (user request): the LAN portal is OFF during normal operation - it
+// wastes cycles and answers all day for a page used a few times a
+// year. Holding BOOT for 2 s while running starts it on demand
+// (http://aprs-map.local / the device IP); BOOT 2 s again, or 5 min
+// without a page access, stops it.
 static String cfgSsid, cfgPass, cfgCall;
-static String cfgAisKey;
 static int cfgPasscode = 0;
 static double homeLat = FILTER_LAT, homeLon = FILTER_LON;
 static int cfgRangeKm = FILTER_RANGE_KM;
 static int cfgScreens = 7;   // v175N: which screens are shown (portal setting)
 static WebServer cfgServer(80);
 static DNSServer dnsServer;
-static bool cfgServerStarted = false;
+static bool cfgServerStarted = false;   // handlers registered (once)
+static bool cfgServerRunning = false;   // S3 v24: server begin()ed
+static bool mdnsRunning = false;        // S3 v24
+static bool runtimePortalActive = false;   // S3 v24: BOOT-started LAN portal
 static bool portalApMode = false;
 static uint32_t portalLastActivityMs = 0;   // last portal page access (v75)
 
@@ -59,11 +66,6 @@ static void loadSettings(bool skipNvs) {
   cfgPass = WIFI_PASSWORD;
   cfgCall = APRS_CALLSIGN;
   cfgPasscode = APRS_PASSCODE;
-#ifdef AIS_API_KEY
-  cfgAisKey = AIS_API_KEY;
-#else
-  cfgAisKey = "";
-#endif
   homeLat = FILTER_LAT;
   homeLon = FILTER_LON;
   cfgRangeKm = FILTER_RANGE_KM;
@@ -73,7 +75,6 @@ static void loadSettings(bool skipNvs) {
   cfgSsid = p.getString("ssid", cfgSsid);
   cfgPass = p.getString("pass", cfgPass);
   cfgCall = p.getString("call", cfgCall);
-  cfgAisKey = p.getString("aiskey", cfgAisKey);
   cfgPasscode = p.getInt("passcode", cfgPasscode);
   homeLat = p.getDouble("lat", homeLat);
   homeLon = p.getDouble("lon", homeLon);
@@ -114,7 +115,6 @@ static void handleRoot() {
   h += "<label>中心の緯度<input name='lat' value='" + String(latBuf) + "'></label>";
   h += "<label>中心の経度<input name='lon' value='" + String(lonBuf) + "'></label>";
   h += "<label>受信範囲 km<input name='range' type='number' value='" + String(cfgRangeKm) + "'></label>";
-  h += "<label>AIS APIキー (aisstream.io)<input name='aiskey' value='" + htmlEsc(cfgAisKey) + "'></label>";
   // v175N: screen selection (user request) - unselected screens
   // are not shown at all, not even as a tab in the top bar.
   h += "<p style='margin-top:16px;font-weight:bold'>表示する画面</p>";
@@ -149,7 +149,6 @@ static void handleSave() {
     String call = cfgServer.arg("call");
     if (call.length() > 0) p.putString("call", call);
     p.putInt("passcode", cfgServer.arg("passcode").toInt());
-    p.putString("aiskey", cfgServer.arg("aiskey"));
     double la = cfgServer.arg("lat").toDouble();
     double lo = cfgServer.arg("lon").toDouble();
     if (la >= -90 && la <= 90 && lo >= -180 && lo <= 180 && (la != 0 || lo != 0)) {
@@ -204,13 +203,27 @@ static void handleNotFound() {
 }
 
 static void startConfigServer() {
-  if (cfgServerStarted) return;
-  cfgServerStarted = true;
-  cfgServer.on("/", HTTP_GET, handleRoot);
-  cfgServer.on("/save", HTTP_POST, handleSave);
-  cfgServer.on("/mapgen", HTTP_GET, handleMapGen);
-  cfgServer.onNotFound(handleNotFound);
-  cfgServer.begin();
+  if (!cfgServerStarted) {
+    cfgServerStarted = true;
+    cfgServer.on("/", HTTP_GET, handleRoot);
+    cfgServer.on("/save", HTTP_POST, handleSave);
+    cfgServer.on("/mapgen", HTTP_GET, handleMapGen);
+    cfgServer.onNotFound(handleNotFound);
+  }
+  if (!cfgServerRunning) { cfgServer.begin(); cfgServerRunning = true; }
+  portalLastActivityMs = millis();
+}
+
+static void stopConfigServer() {
+  if (cfgServerRunning) { cfgServer.stop(); cfgServerRunning = false; }
+}
+
+static void beginMdns() {
+  if (!mdnsRunning) { MDNS.begin("aprs-map"); mdnsRunning = true; }
+}
+
+static void endMdns() {
+  if (mdnsRunning) { MDNS.end(); mdnsRunning = false; }
 }
 
 static void drawPortalScreen() {
@@ -262,7 +275,8 @@ static void runPortal() {
         WiFi.softAPdisconnect(true);
         WiFi.mode(WIFI_STA);
         portalApMode = false;
-        MDNS.begin("aprs-map");
+        stopConfigServer();   // S3 v24: runtime LAN portal stays OFF
+        endMdns();
         return;
       }
     }
@@ -283,14 +297,13 @@ static void wifiPhase(bool forcePortal) {
     uint32_t t0 = millis();
     while (millis() - t0 < 12000 && WiFi.status() != WL_CONNECTED) delay(100);
     if (WiFi.status() == WL_CONNECTED) {
-      startConfigServer();
-      MDNS.begin("aprs-map");
+      // S3 v24: no LAN portal during normal operation. BOOT 2 s
+      // starts it on demand (runtimePortalLoop, below setup()).
       return;
     }
     WiFi.disconnect();
   }
   runPortal();
-  startConfigServer();
 }
 
 // BOOT (GPIO0) held AT power-on puts the ESP32 into download mode and
@@ -365,25 +378,12 @@ static int mapSplitRow = 0;            // S3 v5: rows of the frame held by mapCh
 static Aircraft acBack[MAX_AC];
 static volatile bool acFetchReq = false, acDataReady = false;
 static volatile bool acFetchBusy = false;   // v107: a fetch is in flight
-static volatile bool aisConnectReq = false;   // v108: AIS connect request
-static volatile bool aisPauseReq = false;     // v151N: fetch asks AIS to drop
-// v165N: Core 1 never touches the AIS socket directly any more.
-// The v164N panic backtrace ran loop -> sendAisSubscription ->
-// WiFiClientSecure::write -> stop -> mbedtls_ssl_free -> CORRUPT
-// HEAP assert: Core 1 writing/stopping the socket races this
-// task's connect/teardown churn on the same SSL object. Core 1
-// only raises these flags; the Core 0 task performs the ops.
-static volatile bool aisStopReq = false;
-static volatile bool aisSubSendReq = false;
-static volatile bool aisPingReq = false;
-static volatile bool aisPongReq = false;
-static uint8_t aisPongBuf[128];
-static volatile size_t aisPongLen = 0;
-static bool sendAisSubscription();            // fwd
-static bool wsSendFrame(uint8_t opcode, const uint8_t* data, size_t len);   // fwd
 static bool colourMapActive();                // v151N: defined at genColorActive
-static bool aisConnect();                     // v108: defined with the AIS code
-static void aisServiceSocketReqs();           // v165N: ditto
+static void fetchAisSnapshotDo();             // S3 v25: defined with the AIS code
+// S3 v25: AIS snapshot (Open Waters) state
+static volatile bool aisSnapReq = false;          // poll request for the Core 0 task
+static uint32_t aisLastSnapOkMs = 0;              // last good snapshot poll
+static uint32_t aisLastSnapMs = 0;                // last snapshot poll attempt (loop)
 static SemaphoreHandle_t acMutex = nullptr, chunkMutex = nullptr;
 static bool mapChunkPermanent = false;   // S3 v3: see setup()
 static void freeMapChunk() {
@@ -465,48 +465,25 @@ static void tlsReserveRetake() {
   tlsReserveBytes = 0;
   Serial.println("tls reserve: FAILED");
 }
-static void wsInflateReleasePair();   // v143N: defined by wsInflate
-static void wsInflateReclaimPair();   // v143N
 static void fetchAircraftDo();
 static void fetchAircraft() {
   if (tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
   fetchAircraftDo();
   tlsReserveRetake();
 }
-static bool fetchAircraftInner() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  // v137: free the chunk for the handshake again (the v136 log
-  // proved the failure is an X509 cert-chain allocation inside
-  // mbedTLS - the handshake needs every KB it can get). The v134
-  // pin is replaced by the drawMap gate above: while acFetchBusy
-  // is set, drawMap leaves the chunk free and renders line-by-line,
-  // so nothing steals the headroom mid-handshake.
-  freeMapChunk();
-  // v151N: with AIS live (v149N), its TLS session buffers are the
-  // last big DMA consumer, and the ADS-B handshake now dies one
-  // stage deeper ('PK - Memory allocation failed'). In LINE mode
-  // only, ask aisLoop to drop the stream for this fetch and wait
-  // until it has (aisLoop owns the socket; it reconnects ~20 s
-  // later, gated on !acFetchBusy). Colour mode has the sea mask's
-  // 38 KB back in the pool and needs no pause.
-  // S3 v12: on THIS board the pause applies in colour mode too
-  // (the M5 v8.31 pattern). The 2026-11-20 AIS logs showed the
-  // fetch running beside the live stream shredding the DMA pool
-  // (dmaLargest 18,420 B with 60 KB free) until neither the AIS
-  // reconnect nor the reserve retake could run. One TLS stack at
-  // a time from now on; ships persist across the short gaps.
-  if (true) {
-    aisPauseReq = true;
-    uint32_t t0 = millis();
-    while (aisPauseReq && millis() - t0 < 2000) delay(5);
-  }
-  // v138 diag: exact heap state the handshake starts from
-  Serial.printf("ADS-B fetch start: free %u largest %u dmaFree %u dmaLargest %u reserveBytes %u\n",
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-                (unsigned)tlsReserveBytes);
+// S3 v23 (user request): two ADS-B sources. adsb.lol is primary,
+// adsb.fi (same per-aircraft fields; its array key is "aircraft"
+// instead of "ac") is the fallback - on 2026-11-21 adsb.lol spent
+// the day rate-limiting (HTTP 429) and returning 0 aircraft while
+// adsb.fi served the same sky normally. The source that worked
+// is tried first next time; a source that answers 0 aircraft is
+// only believed after the other source has had its say.
+static bool acPreferFi = false;
+
+// One source attempt: GET + parse into acBack. Returns the
+// aircraft count (>= 0) on an HTTP 200 with a usable body,
+// -1 on failure. Does not publish.
+static int fetchFromSource(bool fi) {
   WiFiClientSecure client;
   client.setInsecure();   // (this core's WiFiClientSecure has no setBufferSizes)
   HTTPClient http;
@@ -515,14 +492,15 @@ static bool fetchAircraftInner() {
   if (distNm < 10) distNm = 10;
   if (distNm > 250) distNm = 250;
   char url[128];
-  snprintf(url, sizeof(url), "https://api.adsb.lol/v2/lat/%.4f/lon/%.4f/dist/%d",
-           homeLat, homeLon, distNm);
-  if (!http.begin(client, url)) return false;
+  if (fi) snprintf(url, sizeof(url), "https://opendata.adsb.fi/api/v2/lat/%.4f/lon/%.4f/dist/%d",
+                   homeLat, homeLon, distNm);
+  else snprintf(url, sizeof(url), "https://api.adsb.lol/v2/lat/%.4f/lon/%.4f/dist/%d",
+                homeLat, homeLon, distNm);
+  if (!http.begin(client, url)) return -1;
   int code = http.GET();
   if (code < 0) {
-    // v136: capture the BearSSL error (discriminates handshake
-    // alert vs timeout vs OOM - plain "-1" hid which), then retry
-    // once; the failures are intermittent.
+    // v136: capture the BearSSL error, then retry once; the
+    // failures are intermittent.
     char ebuf[80];
     client.lastError(ebuf, sizeof(ebuf));
     Serial.printf("ADS-B http %d ssl: %s (free %u largest %u)\n", code, ebuf,
@@ -530,7 +508,7 @@ static bool fetchAircraftInner() {
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     http.end();
     delay(700);
-    if (!http.begin(client, url)) return false;
+    if (!http.begin(client, url)) return -1;
     code = http.GET();
     if (code < 0) {
       client.lastError(ebuf, sizeof(ebuf));
@@ -538,15 +516,16 @@ static bool fetchAircraftInner() {
     }
   }
   if (code != 200) {
-    Serial.printf("ADS-B http %d (largest heap %u)\n", code,
+    Serial.printf("ADS-B http %d (%s, largest heap %u)\n", code, fi ? "adsb.fi" : "adsb.lol",
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    http.end(); return false;
+    http.end(); return -1;
   }
   lastTlsOkMs = millis();   // S3 v17
   String body = http.getString();
   http.end();
   int acPos = body.indexOf("\"ac\":");
-  if (acPos < 0) { Serial.printf("ADS-B bad body, len %u\n", (unsigned)body.length()); return false; }
+  if (acPos < 0) acPos = body.indexOf("\"aircraft\":");   // adsb.fi schema
+  if (acPos < 0) { Serial.printf("ADS-B bad body, len %u\n", (unsigned)body.length()); return -1; }
   int n = 0;
   int pos = acPos;
   while (n < MAX_AC) {
@@ -579,26 +558,56 @@ static bool fetchAircraftInner() {
     if (next < 0) break;
     pos = next;
   }
-  if (acMutex) xSemaphoreTake(acMutex, portMAX_DELAY);
-  memcpy(aircraft, acBack, sizeof(acBack));
-  acCount = n;
-  if (acMutex) xSemaphoreGive(acMutex);
-  acDataReady = true;
-  Serial.printf("aircraft: %d\n", n);
-  return true;
+  return n;
 }
 
-// v143N: the handshake was still starving with the pair held
-// (v142N log: dmaFree 47240 at fetch start, X509 alloc failed -
-// the handshake needs more TOTAL DMA room, not just a big block).
-// The AIS inflate pair (~39 KB of DMA) is not needed while no ship
-// message is being decompressed, so lend it to the handshake and
-// re-allocate it right after; wsInflate drops messages while the
-// pair is out (rare, and self-healing at the reclaim).
+static bool fetchAircraftInner() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  // v137: free the chunk for the handshake again (the v136 log
+  // proved the failure is an X509 cert-chain allocation inside
+  // mbedTLS - the handshake needs every KB it can get). The v134
+  // pin is replaced by the drawMap gate above: while acFetchBusy
+  // is set, drawMap leaves the chunk free and renders line-by-line,
+  // so nothing steals the headroom mid-handshake.
+  freeMapChunk();
+  // (The v151N/S3 v12 AIS pause that used to sit here went with
+  // the stream in S3 v27 - there is no second TLS session now.)
+  // v138 diag: exact heap state the handshake starts from
+  Serial.printf("ADS-B fetch start: free %u largest %u dmaFree %u dmaLargest %u reserveBytes %u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                (unsigned)tlsReserveBytes);
+  bool zeroSeen = false;
+  for (int t = 0; t < 2; t++) {
+    bool fi = (t == 0) ? acPreferFi : !acPreferFi;
+    int n = fetchFromSource(fi);
+    if (n > 0) {
+      acPreferFi = fi;
+      if (acMutex) xSemaphoreTake(acMutex, portMAX_DELAY);
+      memcpy(aircraft, acBack, sizeof(acBack));
+      acCount = n;
+      if (acMutex) xSemaphoreGive(acMutex);
+      acDataReady = true;
+      Serial.printf("aircraft: %d (%s)\n", n, fi ? "adsb.fi" : "adsb.lol");
+      return true;
+    }
+    if (n == 0) zeroSeen = true;   // answered, but an empty sky is only believed after the other source too
+    else if (t == 0) Serial.printf("ADS-B %s failed, trying the other source\n", fi ? "adsb.fi" : "adsb.lol");
+  }
+  if (zeroSeen) {
+    if (acMutex) xSemaphoreTake(acMutex, portMAX_DELAY);
+    acCount = 0;
+    if (acMutex) xSemaphoreGive(acMutex);
+    acDataReady = true;
+    Serial.printf("aircraft: 0 (both sources)\n");
+    return true;
+  }
+  return false;
+}
 static void fetchAircraftDo() {
-  wsInflateReleasePair();
   bool ok = fetchAircraftInner();
-  wsInflateReclaimPair();
   // v161N: the endpoint is healthy (verified from the host) but
   // the device's connections are reset every cycle (NET_RECV_
   // FAILED) - the signature of per-IP rate limiting after a day
@@ -619,25 +628,20 @@ static void fetchAircraftDo() {
 static void acFetchTask(void* arg) {
   (void)arg;
   for (;;) {
-    aisServiceSocketReqs();   // v165N: AIS socket writes/stops live on this task
     if (acFetchReq && !tlsReserve) {
       // v170N reserve recovery: the reserve degrades with uptime
       // (57K -> 32K -> FAILED) as retakes lose to fragmentation,
-      // and FLIGHT then stays dead until a reboot. Before this
-      // fetch, drop the AIS stream - deleting its client truly
-      // frees the TLS buffers - and free the map chunk, then
-      // re-take on the temporarily roomier pool.
-      aisPauseReq = true;
-      uint32_t t0 = millis();
-      while (aisPauseReq && millis() - t0 < 2000) delay(5);
-      aisServiceSocketReqs();   // performs the pending destroy
+      // and FLIGHT then stays dead until a reboot. Free the map
+      // chunk and re-take on the temporarily roomier pool.
+      // (S3 v27: the AIS-stream drop that used to precede this
+      // went with the stream.)
       freeMapChunk();
       tlsReserveRetake();
       Serial.printf("tls reserve recovery: %s (%u bytes)\n",
                     tlsReserve ? "ok" : "FAILED", (unsigned)tlsReserveBytes);
     }
     if (acFetchReq) { acFetchReq = false; acFetchBusy = true; fetchAircraft(); acFetchBusy = false; }
-    if (aisConnectReq) { aisConnectReq = false; acFetchBusy = true; aisConnect(); acFetchBusy = false; }
+    if (aisSnapReq) { aisSnapReq = false; acFetchBusy = true; fetchAisSnapshotDo(); acFetchBusy = false; }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -684,7 +688,7 @@ static void ensureRoute(const char* fl) {
   r.ok = r.orig[0] && r.dest[0];
 }
 
-// ---------------- ships (AIS via aisstream.io) ----------------
+// ---------------- ships (AIS) ----------------
 // Live vessel positions streamed over a WebSocket (see the AIS engine
 // further down). ShipStaticData (name / destination / type) arrives
 // only occasionally, so those fields fill in whenever they turn up.
@@ -704,7 +708,6 @@ struct Ship {
 };
 static Ship ships[MAX_SHIPS];
 static uint32_t selShipMmsi = 0;   // ship centred / shown in the detail panel
-static bool aisOnline = false;
 
 static void trimSpaces(char* s) {
   int L = strlen(s);
@@ -2085,8 +2088,8 @@ static void __attribute__((noinline)) mapGenBoot() {
     return;
   }
   Serial.println("MAPGEN: generating maps for the configured centre...");
-  cfgServer.stop();          // v5.16: free every heap byte for the
-  MDNS.end();                // TLS handshake (see mgGenerate)
+  stopConfigServer();        // v5.16: free every heap byte for the
+  endMdns();                 // TLS handshake (see mgGenerate)
   delay(100);
   bool genOk = mgGenerate();
   mgCkpt = 0;   // v8.6: only a hard reset leaves it set
@@ -2094,8 +2097,8 @@ static void __attribute__((noinline)) mapGenBoot() {
   mgTls.stop();
   if (!genOk) mgDumpFailed();   // v6.4: serial dump of the bad record
   mgFreeGenBuffers();   // hand the heap back to normal operation
-  cfgServer.begin();
-  MDNS.begin("aprs-map");
+  // S3 v24: the LAN portal is NOT restarted here - it stays off
+  // during normal operation until BOOT is held for 2 s.
   bool actOk = genOk && mgActivate();
   { Preferences p;   // v8.17: persist the outcome for the diag screen
     if (p.begin("aprsmap", false)) {
@@ -2921,7 +2924,6 @@ static void drawBarF(bool force, bool push) {
   else snprintf(scale, sizeof(scale), "x%.1f", vScale);
   if (screenMode == 0) snprintf(mid, sizeof(mid), "%s %s", aprsStateText(), scale);
   else if (screenMode == 1) snprintf(mid, sizeof(mid), "AC %d %s", acCount, scale);
-  else if (cfgAisKey.length() < 10) snprintf(mid, sizeof(mid), "SET AIS KEY %s", scale);
   else snprintf(mid, sizeof(mid), "SHIP %d %s", countShips(), scale);
   snprintf(leftKey, sizeof(leftKey), "%c", screenMode == 0 ? 'A' : (screenMode == 1 ? 'F' : 'S'));
   // No visible change -> leave the screen alone (user request: update
@@ -4447,516 +4449,134 @@ static void aprsLoop() {
   }
 }
 
-// ---------------- AIS stream (aisstream.io) ----------------
-// One persistent WebSocket; the subscription names the Flight/AIS map
-// area, so every ship received belongs on that map. Position reports
-// arrive every few seconds per ship; static data (name / destination /
-// type) only now and then. Reconnect is handled by the library.
-static bool aisSubConfirmed = false;
-static uint32_t aisLastSubMs = 0;
-static bool wsSendFrame(uint8_t opcode, const uint8_t* data, size_t len);   // fwd
-
-static bool sendAisSubscription() {
-  // Bounds of MAP_LIST[1] (the Flight/AIS map), as [lat, lon] pairs.
-  char sub[320];
-  snprintf(sub, sizeof(sub),
-    "{\"APIKey\":\"%s\",\"BoundingBoxes\":[[[%.4f,%.4f],[%.4f,%.4f]]],"
-    "\"FilterMessageTypes\":[\"PositionReport\",\"ShipStaticData\"]}",
-    cfgAisKey.c_str(), MAP_LIST[1].south, MAP_LIST[1].west,
-    MAP_LIST[1].north, MAP_LIST[1].east);
-  aisLastSubMs = millis();
-  return wsSendFrame(0x1, (const uint8_t*)sub, strlen(sub));
-}
-
-static void parseAis(const String& msg) {
-  if (msg.indexOf("\"SubscriptionConfirmation\"") >= 0) {
-    aisSubConfirmed = true;
-    Serial.println("AIS subscription confirmed");
+// ---------------- AIS ships (Open Waters snapshot) ----------------
+// AIS comes from the Open Waters (aiscast) snapshot API: it
+// aggregates several AIS networks (AISHub and others) and serves a
+// GeoJSON snapshot of the vessels inside a bounding box over plain
+// HTTPS - no API key needed. Polled every 60 s while the AIS screen
+// is shown (plus once on tab arrival); this is the only AIS source.
+// Runs on the Core 0 task; the map chunk is freed first for
+// handshake headroom, like an ADS-B fetch.
+static void fetchAisSnapshotDo() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  freeMapChunk();
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(12000);
+  char url[192];
+  snprintf(url, sizeof(url),
+           "https://ais.openwaters.io/v1/vessels?bbox=%.4f,%.4f,%.4f,%.4f&kind=vessel",
+           MAP_LIST[1].south, MAP_LIST[1].west, MAP_LIST[1].north, MAP_LIST[1].east);
+  if (!http.begin(client, url)) return;
+  http.addHeader("User-Agent", "APRSMap-ESP32/1.0");
+  // S3 v28 diag: http -1 on v27 - separate DNS / heap / TLS causes
+  // before changing anything else (same pattern as fetchFromSource).
+  {
+    IPAddress ip;
+    bool dnsOk = WiFi.hostByName("ais.openwaters.io", ip);
+    Serial.printf("AIS snapshot start: dns %s (%s) free %u largest %u dmaLargest %u\n",
+                  dnsOk ? "ok" : "FAIL", dnsOk ? ip.toString().c_str() : "-",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+  }
+  int code = http.GET();
+  if (code < 0) {
+    char ebuf[80];
+    client.lastError(ebuf, sizeof(ebuf));
+    Serial.printf("AIS snapshot http %d ssl: %s\n", code, ebuf);
+    http.end();
+    delay(700);
+    if (!http.begin(client, url)) return;
+    http.addHeader("User-Agent", "APRSMap-ESP32/1.0");
+    code = http.GET();
+    if (code < 0) {
+      client.lastError(ebuf, sizeof(ebuf));
+      Serial.printf("AIS snapshot retry http %d ssl: %s\n", code, ebuf);
+    }
+  }
+  if (code != 200) {
+    Serial.printf("AIS snapshot http %d\n", code);
+    http.end();
     return;
   }
-  int mk = msg.indexOf("\"MMSI\":");
-  if (mk < 0) return;
-  uint32_t mmsi = (uint32_t)strtoul(msg.c_str() + mk + 7, nullptr, 10);
-  if (!mmsi) return;
-  int len = (int)msg.length();
-  if (msg.indexOf("\"PositionReport\"") >= 0) {
-    int seg = msg.indexOf("\"PositionReport\":{");
-    if (seg < 0) return;
-    double la, lo;
-    bool okPos = jsonNumField(msg, "\"Latitude\":", seg, len, la) &&
-                 jsonNumField(msg, "\"Longitude\":", seg, len, lo);
-    if (!okPos) {   // fall back to the MetaData position
-      okPos = jsonNumField(msg, "\"latitude\":", 0, len, la) &&
-              jsonNumField(msg, "\"longitude\":", 0, len, lo);
+  lastTlsOkMs = millis();   // S3 v17 stamp (heap-death exclusion)
+  String body = http.getString();
+  http.end();
+  aisLastSnapOkMs = millis();
+  time_t nowT = time(nullptr);
+  bool timeOk = nowT > 1700000000;
+  int total = 0, added = 0;
+  int blen = (int)body.length();
+  int pos = 0;
+  while (pos < blen) {
+    int c = body.indexOf("\"coordinates\":[", pos);
+    if (c < 0) break;
+    const char* cp = body.c_str() + c + 15;
+    double lo = strtod(cp, nullptr);
+    const char* comma = strchr(cp, ',');
+    if (!comma) break;
+    double la = strtod(comma + 1, nullptr);
+    int m = body.indexOf("\"mmsi\":", c);
+    if (m < 0) break;
+    int next = body.indexOf("\"coordinates\":[", c + 15);
+    int segEnd = next >= 0 ? next : blen;
+    uint32_t mmsi = (uint32_t)strtoul(body.c_str() + m + 7, nullptr, 10);
+    pos = m + 7;
+    if (!mmsi) continue;
+    // Age from "seen" (UTC ISO8601): snapshot entries age out on
+    // the same 30 min rule as stream ships.
+    uint32_t ageSec = 0;
+    if (timeOk) {
+      int sk = body.indexOf("\"seen\":\"", m);
+      if (sk >= 0 && sk < segEnd) {
+        int yy, mo, dd, hh, mi, ss;
+        if (sscanf(body.c_str() + sk + 8, "%d-%d-%dT%d:%d:%d",
+                   &yy, &mo, &dd, &hh, &mi, &ss) == 6) {
+          struct tm tmv = {};
+          tmv.tm_year = yy - 1900; tmv.tm_mon = mo - 1; tmv.tm_mday = dd;
+          tmv.tm_hour = hh; tmv.tm_min = mi; tmv.tm_sec = ss;
+          time_t seenT = mktime(&tmv);   // TZ is UTC (configTime(0,0,...))
+          if (seenT > 0 && nowT >= seenT) ageSec = (uint32_t)(nowT - seenT);
+        }
+      }
     }
-    if (!okPos) return;
+    if (ageSec > 1800) continue;
     Ship* s = findShip(mmsi, true);
-    if (!s) return;
+    if (!s) continue;
     bool isNew = !s->used || !s->hasPos;
     s->used = true; s->hasPos = true; s->mmsi = mmsi;
     s->lat = la; s->lon = lo;
     double v;
-    if (jsonNumField(msg, "\"Sog\":", seg, len, v)) s->sog = (v <= 102.2) ? (float)v : 0;
-    if (jsonNumField(msg, "\"Cog\":", seg, len, v)) s->cog = (float)v;
-    if (jsonNumField(msg, "\"NavigationalStatus\":", seg, len, v)) s->navStatus = (int)v;
-    char nm[28];
-    if (jsonStrField(msg, "\"ShipName\":\"", 0, len, nm, sizeof(nm))) {
-      trimSpaces(nm);
-      if (nm[0]) { strncpy(s->name, nm, sizeof(s->name) - 1); s->name[sizeof(s->name) - 1] = 0; }
-    }
-    s->lastMs = millis();
-    stationsDirty = true;
-    if (isNew) Serial.printf("AIS ship: %s (%lu) total %d\n",
-                             s->name[0] ? s->name : "?", (unsigned long)mmsi, countShips());
-  } else if (msg.indexOf("\"ShipStaticData\"") >= 0) {
-    Ship* s = findShip(mmsi, true);
-    if (!s) return;
-    s->used = true; s->mmsi = mmsi;
+    if (jsonNumField(body, "\"sog\":", m, segEnd, v)) s->sog = (v <= 102.2) ? (float)v : 0;
+    if (jsonNumField(body, "\"cog\":", m, segEnd, v)) s->cog = (float)v;
+    if (jsonNumField(body, "\"nav_status\":", m, segEnd, v)) s->navStatus = (int)v;
+    if (jsonNumField(body, "\"type\":", m, segEnd, v)) s->type = (int)v;
     char buf[28];
-    if (jsonStrField(msg, "\"Name\":\"", 0, len, buf, sizeof(buf))) {
+    if (jsonStrField(body, "\"name\":\"", m, segEnd, buf, sizeof(buf))) {
       trimSpaces(buf);
       if (buf[0]) { strncpy(s->name, buf, sizeof(s->name) - 1); s->name[sizeof(s->name) - 1] = 0; }
     }
-    if (jsonStrField(msg, "\"Destination\":\"", 0, len, buf, sizeof(buf))) {
+    if (jsonStrField(body, "\"destination\":\"", m, segEnd, buf, sizeof(buf))) {
       trimSpaces(buf);
-      strncpy(s->dest, buf, sizeof(s->dest) - 1); s->dest[sizeof(s->dest) - 1] = 0;
-    }
-    double v;
-    if (jsonNumField(msg, "\"Type\":", 0, len, v)) s->type = (int)v;
-    if (s->hasPos) { s->lastMs = millis(); stationsDirty = true; }
-  }
-}
-
-// ---- hand-rolled WebSocket client with permessage-deflate --------
-// aisstream silently ignores subscriptions from clients that do not
-// negotiate compression (only a deflate-capable test client ever
-// received data, incl. the SubscriptionConfirmation). The WebSockets
-// library cannot negotiate permessage-deflate, so the protocol runs
-// here directly on WiFiClientSecure, with miniz/tinfl inflating. The
-// streaming inflater keeps its dictionary between messages, so the
-// server's context takeover works (validated on a host build with
-// python-generated takeover streams before this was written).
-static WiFiClientSecure* aisSock = nullptr;   // v170N: heap object
-// v170N: stop() alone does NOT release the TLS transform buffers
-// (the v151N pause freed ~nothing - the fetch-start prints proved
-// it). Deleting the object does. Creation/destruction happen only
-// on the Core 0 task (v165N discipline); Core 1 reads only while
-// aisSockUp, which is set after creation and cleared before any
-// destroy request.
-static void aisSockDestroy() {
-  if (aisSock) { aisSock->stop(); delete aisSock; aisSock = nullptr; }
-}
-static bool aisSockNew() {
-  aisSockDestroy();
-  aisSock = new WiFiClientSecure();
-  return aisSock != nullptr;
-}
-static bool aisSockUp = false;
-static uint32_t aisNextTryMs = 0;
-static uint32_t aisLastRxMs = 0;
-static bool aisDeflate = false;
-static String wsBuf;              // received bytes not yet framed
-static String wsMsg;              // payload of the message being assembled
-static bool wsMsgCompressed = false;
-static bool wsMsgStarted = false;
-
-static lgfx_tinfl_decompressor* inflState = nullptr;
-static lgfx_mz_uint8* inflDict = nullptr;
-static size_t inflDictPos = 0;
-static volatile bool inflateReleased = false;   // v143N: pair lent out
-static volatile bool inflateInUse = false;      // v143N: Core 1 inside wsInflate
-
-static void wsInflateReset() {
-  if (inflState) { lgfx_tinfl_init(inflState); inflDictPos = 0; }
-}
-
-// Inflate one permessage-deflate message (its sync-flush tail was
-// stripped on the wire; it is appended back here). The decompressor
-// and its dictionary persist across messages (context takeover).
-static bool wsInflatePrealloc();   // v133: defined below, used in setup
-static bool wsInflateBody(const uint8_t* in, size_t inLen, String& out);
-static bool wsInflate(const uint8_t* in, size_t inLen, String& out) {
-  if (inflateReleased) return false;   // v143N: pair is lent to a handshake
-  if (!inflState || !inflDict) {
-    freeMapChunk();   // make room first
-    // v133: the ADS-B escrow (40 KB) is also handed back - with it
-    // held, the pair below could not be allocated in the colour
-    // mode heap layout and every ship message was dropped SILENTLY
-    // (connect + subscription worked, zero ships ever stored).
-    // The fetch wrapper re-takes the escrow after its next fetch.
-    if (tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
-    // v109: DRAM only - the decompressor byte-accesses both buffers
-    // v144N: dict FIRST - it needs a 32 KB contiguous DMA block;
-    // taking the small state first can split the only hole that
-    // fits it (v143N: reclaim after a handshake failed with
-    // 'AIS inflate: no mem (largest 40948)').
-    if (!inflDict)
-      inflDict = (lgfx_mz_uint8*)heap_caps_malloc(TINFL_LZ_DICT_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (!inflState)
-      inflState = (lgfx_tinfl_decompressor*)heap_caps_malloc(sizeof(lgfx_tinfl_decompressor), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (!inflState || !inflDict) {
-      // v129: free whichever half succeeded. The old code kept a
-      // lone state pointer, so the NEXT message skipped allocation
-      // and ran the decompressor with a NULL dictionary - a store
-      // to address 0 inside tinfl (the user's StoreProhibited
-      // panic, EXCVADDR 0). The colour mode's different heap layout
-      // (no sea-mask block) is what made the 32 KB dict fail now.
-      if (inflState) { free(inflState); inflState = nullptr; }
-      if (inflDict) { free(inflDict); inflDict = nullptr; }
-      static uint32_t lastNoMemLogMs = 0;   // v133: never fail silently again
-      if (millis() - lastNoMemLogMs > 10000) {
-        lastNoMemLogMs = millis();
-        Serial.printf("AIS inflate: no mem (largest %u)\n",
-                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      if (strncmp(buf, "\\u003e", 6) == 0) {   // ">JP ..." port prefix
+        memmove(buf + 1, buf + 6, strlen(buf + 6) + 1);
+        buf[0] = '>';
       }
-      return false;
+      if (buf[0]) { strncpy(s->dest, buf, sizeof(s->dest) - 1); s->dest[sizeof(s->dest) - 1] = 0; }
     }
-    lgfx_tinfl_init(inflState);
-    inflDictPos = 0;
-  }
-  // v143N: mark the pair in use so the Core 0 releaser waits for
-  // this decompress to finish before freeing it; the re-check
-  // catches a release that landed during the allocation above.
-  inflateInUse = true;
-  if (inflateReleased || !inflState || !inflDict) { inflateInUse = false; return false; }
-  bool ok = wsInflateBody(in, inLen, out);
-  inflateInUse = false;
-  return ok;
-}
-
-// v133: allocate the inflate pair once at boot, from the freshest
-// heap, instead of lazily at the first ship message.
-static bool wsInflatePrealloc() {
-  if (!inflDict)   // v144N: dict first (see wsInflate)
-    inflDict = (lgfx_mz_uint8*)heap_caps_malloc(TINFL_LZ_DICT_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-  if (!inflState)
-    inflState = (lgfx_tinfl_decompressor*)heap_caps_malloc(sizeof(lgfx_tinfl_decompressor), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-  if (!inflState || !inflDict) {
-    if (inflState) { free(inflState); inflState = nullptr; }
-    if (inflDict) { free(inflDict); inflDict = nullptr; }
-    return false;
-  }
-  lgfx_tinfl_init(inflState);
-  inflDictPos = 0;
-  return true;
-}
-
-// v143N: lend the pair to a TLS handshake (Core 0) and take it
-// back. The releaser waits out any in-flight decompress on Core 1
-// (bounded, tinfl takes ms); wsInflate drops messages meanwhile.
-static void wsInflateReleasePair() {
-  inflateReleased = true;
-  uint32_t t0 = millis();
-  while (inflateInUse && millis() - t0 < 500) delay(1);
-  if (inflState) { free(inflState); inflState = nullptr; }
-  if (inflDict) { free(inflDict); inflDict = nullptr; }
-  inflDictPos = 0;
-}
-static void wsInflateReclaimPair() {
-  // v149N: no re-allocation - deflate is not negotiated, so the
-  // pair stays unallocated for good (wsInflate's lazy path remains
-  // as a fallback if a compressed frame ever shows up anyway).
-  inflateReleased = false;
-}
-
-static bool wsInflateBody(const uint8_t* in, size_t inLen, String& out) {
-  static const lgfx_mz_uint8 tail[4] = {0x00, 0x00, 0xFF, 0xFF};
-  size_t off = 0;
-  int iter = 0;
-  for (;;) {
-    const lgfx_mz_uint8* chunk;
-    size_t chunkLen;
-    if (off < inLen) { chunk = in + off; chunkLen = inLen - off; }
-    else if (off < inLen + 4) { chunk = tail; chunkLen = 4 - (off - inLen); }
-    else break;
-    size_t inSize = chunkLen;
-    size_t outSize = TINFL_LZ_DICT_SIZE - inflDictPos;
-    lgfx_mz_uint8* outNext = inflDict + inflDictPos;
-    lgfx_tinfl_status st = lgfx_tinfl_decompress(inflState, chunk, &inSize, inflDict, outNext, &outSize,
-                                       TINFL_FLAG_HAS_MORE_INPUT);
-    off += inSize;
-    if (outSize) {
-      out.concat((const char*)outNext, (unsigned int)outSize);
-      inflDictPos = (inflDictPos + outSize) & (TINFL_LZ_DICT_SIZE - 1);
-      if (out.length() > 16384) return false;
+    s->lastMs = millis() - ageSec * 1000UL;
+    if (isNew) {
+      added++;
+      Serial.printf("AIS ship (snapshot): %s (%lu)\n",
+                    s->name[0] ? s->name : "?", (unsigned long)mmsi);
     }
-    if (st == TINFL_STATUS_FAILED || st == TINFL_STATUS_BAD_PARAM) { wsInflateReset(); return false; }
-    if (off >= inLen + 4 && outSize == 0) break;   // flush fully consumed
-    if (inSize == 0 && outSize == 0) break;        // at a block boundary
-    if (++iter > 10000) return false;
+    total++;
+    stationsDirty = true;
   }
-  return true;
+  Serial.printf("AIS snapshot (Open Waters): %d ships, %d new\n", total, added);
 }
-
-static bool wsSendFrame(uint8_t opcode, const uint8_t* data, size_t len) {
-  if (!aisSockUp || !aisSock) return false;   // v170N: null guard
-  uint8_t hdr[14];
-  int h = 0;
-  hdr[h++] = 0x80 | (opcode & 0x0F);
-  uint8_t maskKey[4];
-  for (int i = 0; i < 4; i++) maskKey[i] = (uint8_t)esp_random();
-  if (len < 126) { hdr[h++] = 0x80 | (uint8_t)len; }
-  else if (len < 65536) { hdr[h++] = 0x80 | 126; hdr[h++] = (uint8_t)((len >> 8) & 0xFF); hdr[h++] = (uint8_t)(len & 0xFF); }
-  else return false;
-  memcpy(hdr + h, maskKey, 4); h += 4;
-  if (aisSock->write(hdr, h) != (size_t)h) return false;
-  uint8_t buf[256];
-  size_t sent = 0;
-  while (sent < len) {
-    size_t n = len - sent; if (n > sizeof(buf)) n = sizeof(buf);
-    for (size_t i = 0; i < n; i++) buf[i] = data[sent + i] ^ maskKey[(sent + i) & 3];
-    if (aisSock->write(buf, n) != n) return false;
-    sent += n;
-  }
-  return true;
-}
-
-static void wsMessageDone() {
-  String plain;
-  const String* msgp = &wsMsg;
-  if (wsMsgCompressed) {
-    if (!wsInflate((const uint8_t*)wsMsg.c_str(), wsMsg.length(), plain)) {
-      wsMsg = "";
-      return;
-    }
-    msgp = &plain;
-  }
-  parseAis(*msgp);
-  wsMsg = "";
-}
-
-// Parse and dispatch every complete frame currently in wsBuf.
-static void wsProcess() {
-  for (;;) {
-    if (wsBuf.length() < 2) return;
-    const uint8_t* b = (const uint8_t*)wsBuf.c_str();
-    bool fin = (b[0] & 0x80) != 0;
-    bool rsv1 = (b[0] & 0x40) != 0;
-    uint8_t op = b[0] & 0x0F;
-    bool masked = (b[1] & 0x80) != 0;
-    uint64_t len = b[1] & 0x7F;
-    int hdrLen = 2;
-    if (len == 126) {
-      if (wsBuf.length() < 4) return;
-      len = ((uint64_t)b[2] << 8) | b[3]; hdrLen = 4;
-    } else if (len == 127) {
-      if (wsBuf.length() < 10) return;
-      len = 0; for (int i = 0; i < 8; i++) len = (len << 8) | b[2 + i];
-      hdrLen = 10;
-    }
-    int maskOfs = hdrLen;
-    if (masked) hdrLen += 4;
-    if (len > 65536) { aisStopReq = true; return; }   // stream desync (v165N: stop via the task)
-    if ((uint64_t)wsBuf.length() < (uint64_t)hdrLen + len) return;   // incomplete: wait
-    String payload;
-    payload.reserve((unsigned int)len + 1);
-    const uint8_t* p = b + hdrLen;
-    if (masked) {
-      const uint8_t* mk = b + maskOfs;
-      for (uint64_t i = 0; i < len; i++) payload += (char)(p[i] ^ mk[i & 3]);
-    } else {
-      for (uint64_t i = 0; i < len; i++) payload += (char)p[i];
-    }
-    wsBuf.remove(0, (unsigned int)(hdrLen + (size_t)len));
-    if (op == 0x9) {   // v165N: the pong is written by the Core 0 task
-      size_t pl = payload.length(); if (pl > sizeof(aisPongBuf)) pl = sizeof(aisPongBuf);
-      memcpy(aisPongBuf, payload.c_str(), pl); aisPongLen = pl; aisPongReq = true;
-      continue;
-    }
-    if (op == 0xA) continue;
-    if (op == 0x8) { aisStopReq = true; return; }
-    if (op == 0x1 || op == 0x2) { wsMsg = payload; wsMsgCompressed = rsv1; wsMsgStarted = true; }
-    else if (op == 0x0 && wsMsgStarted) { wsMsg += payload; }
-    else continue;
-    if (fin && wsMsgStarted) { wsMsgStarted = false; wsMessageDone(); }
-  }
-}
-
-static const char WS_B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static void makeWsKey(char* out) {   // Sec-WebSocket-Key: base64 of 16 random bytes
-  uint8_t r[16];
-  for (int i = 0; i < 16; i++) r[i] = (uint8_t)esp_random();
-  int o = 0;
-  for (int i = 0; i < 16; i += 3) {
-    int n = min(3, 16 - i);
-    uint32_t v = ((uint32_t)r[i] << 16) | (n > 1 ? ((uint32_t)r[i + 1] << 8) : 0) | (n > 2 ? r[i + 2] : 0);
-    out[o++] = WS_B64[(v >> 18) & 63];
-    out[o++] = WS_B64[(v >> 12) & 63];
-    out[o++] = n > 1 ? WS_B64[(v >> 6) & 63] : '=';
-    out[o++] = n > 2 ? WS_B64[v & 63] : '=';
-  }
-  out[o] = 0;
-}
-
-static bool aisConnectDo();   // v134: defined below
-// v165N: every AIS socket write/stop Core 1 used to perform
-// inline, serviced here on the socket-owning Core 0 task.
-static void aisServiceSocketReqs() {
-  if (aisStopReq) { aisStopReq = false; aisSockDestroy(); }   // v170N: delete, not stop
-  if (aisSubSendReq) { aisSubSendReq = false; if (aisSock && aisSock->connected()) sendAisSubscription(); }
-  if (aisPingReq) { aisPingReq = false; if (aisSock && aisSock->connected()) wsSendFrame(0x9, nullptr, 0); }
-  if (aisPongReq) { aisPongReq = false; if (aisSock && aisSock->connected()) wsSendFrame(0xA, aisPongBuf, aisPongLen); }
-}
-
-static bool aisUseReserve = false;   // v166N
-static int aisNoResFails = 0;
-static bool aisConnect() {
-  // v166N: the AIS handshake is the smaller of the two, so let
-  // it run WITHOUT the reserve first - the 57 KB hole then stays
-  // intact for the ADS-B fetch (in v165N this connect's session
-  // buffers shrank the reserve to 32 KB and the fetch died at
-  // X509 with ~76 KB total; the v143N pass data point is ~93 KB).
-  // Two consecutive no-reserve failures switch back to freeing
-  // the reserve (the pre-v166N behaviour) for good.
-  if (tlsReserveBytes >= TLS_RESERVE_BYTES) { aisUseReserve = false; aisNoResFails = 0; }   // v170N
-  // S3 v17: when the ambient hole is hopeless anyway (< 40 KB),
-  // skip the two doomed no-reserve attempts (15 s apart in the
-  // 2026-11-20 log) and use the reserve at once.
-  bool useRes = aisUseReserve
-    || heap_caps_get_largest_free_block(MALLOC_CAP_DMA) < 40960;
-  if (useRes && tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
-  wsInflateReleasePair();
-  bool ok = aisConnectDo();
-  wsInflateReclaimPair();
-  if (useRes) tlsReserveRetake();
-  if (!ok && !useRes && ++aisNoResFails >= 2) {
-    aisUseReserve = true;
-    Serial.println("AIS: no-reserve connects failed, will use the reserve from now on");
-  }
-  return ok;
-}
-static bool aisConnectDo() {
-  freeMapChunk();   // v137: handshake headroom (drawMap gates on acFetchBusy)
-  Serial.printf("AIS connect start: dmaFree %u dmaLargest %u\n",
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-  if (!aisSockNew()) { Serial.println("AIS: client alloc failed"); return false; }
-  aisSock->setInsecure();
-  aisSock->setTimeout(10);
-  if (!aisSock->connect("stream.aisstream.io", 443)) {
-    char ebuf[80];
-    aisSock->lastError(ebuf, sizeof(ebuf));
-    Serial.printf("AIS connect failed: %s\n", ebuf);
-    return false;
-  }
-  char key[28];
-  makeWsKey(key);
-  String req;
-  req.reserve(384);
-  req += "GET /v0/stream HTTP/1.1\r\n";
-  req += "Host: stream.aisstream.io\r\n";
-  req += "Upgrade: websocket\r\n";
-  req += "Connection: Upgrade\r\n";
-  req += "Sec-WebSocket-Key: "; req += key; req += "\r\n";
-  req += "Sec-WebSocket-Version: 13\r\n";
-  // v149N: permessage-deflate is NOT offered any more. The 39 KB
-  // inflate pair cannot coexist with the line-mode sea mask plus
-  // the live TLS session in the DMA pool (reclaim AND lazy alloc
-  // both failed: 'AIS inflate: no mem'), and AIS messages are
-  // small - plain JSON frames cost a little bandwidth and need
-  // no decompression buffer at all.
-  req += "User-Agent: APRSMap-ESP32\r\n\r\n";
-  aisSock->print(req);
-  String resp;
-  uint32_t t0 = millis();
-  while (millis() - t0 < 10000 && !resp.endsWith("\r\n\r\n")) {
-    while (aisSock->available()) {
-      resp += (char)aisSock->read();
-      if (resp.length() > 4096) break;
-    }
-    if (!aisSock->connected() && !aisSock->available()) break;
-    delay(2);
-  }
-  if (resp.indexOf(" 101") < 0) {
-    Serial.printf("AIS upgrade failed, resp len %u: %.80s\n",
-                  (unsigned)resp.length(), resp.c_str());
-    aisSock->stop();
-    return false;
-  }
-  aisDeflate = resp.indexOf("permessage-deflate") >= 0;
-  aisSockUp = true;
-  aisOnline = true;
-  aisSubConfirmed = false;
-  aisLastRxMs = millis();
-  wsBuf = ""; wsMsg = ""; wsMsgStarted = false;
-  wsInflateReset();
-  sendAisSubscription();
-  lastTlsOkMs = millis();   // S3 v17
-  Serial.println("AIS connected");
-  return true;
-}
-
-static void aisLoop() {
-  if (aisPauseReq) {   // v151N: drop the stream for an ADS-B fetch
-    if (aisSockUp) {
-      aisStopReq = true; aisSockUp = false; aisOnline = false; aisSubConfirmed = false;
-      aisNextTryMs = millis() + 20000;
-      Serial.println("AIS paused for ADS-B fetch (line mode)");
-    }
-    aisPauseReq = false;
-  }
-  // S3 v16 (user idea, corrected reading): the AIS screen is not
-  // the one on display - run no stream. TLS work happens only
-  // for the screen the user is actually looking at.
-  if (screenMode != 2) {
-    if (aisSockUp) { aisStopReq = true; aisSockUp = false; aisOnline = false; aisSubConfirmed = false; }
-    return;
-  }
-  // S3 v15 (user idea): the AIS screen is not among the portal's
-  // selected screens - run no stream at all. Every TLS consumer
-  // switched off is heap churn that never happens.
-  if (!(cfgScreens & 4)) {
-    if (aisSockUp) { aisStopReq = true; aisSockUp = false; aisOnline = false; aisSubConfirmed = false; }
-    return;
-  }
-  if (cfgAisKey.length() < 10) return;   // no key set: AIS screen stays empty
-  if (WiFi.status() != WL_CONNECTED) {
-    if (aisSockUp) { aisStopReq = true; aisSockUp = false; aisOnline = false; }
-    return;
-  }
-  uint32_t now = millis();
-  if (!aisSockUp) {
-    // v108: the connect (TLS handshake + up-to-10 s upgrade wait)
-    // runs on the Core 0 task - inline it froze touch for seconds
-    // per attempt, retrying every 15 s while the stream was down.
-    // v164N: the first connect waits for the first ADS-B fetch
-    // (or 30 s) - the fetch needs the reserve hole intact, and
-    // this connect is what fragments it.
-    if (!aisConnectReq && !acFetchBusy && now >= aisNextTryMs
-        && (acFetchedOnce || now > 30000)) {
-      aisConnectReq = true;
-      aisNextTryMs = now + 15000;
-    }
-  } else if (!aisSock || !aisSock->connected()) {
-    aisSockUp = false; aisOnline = false; aisSubConfirmed = false;
-    aisNextTryMs = now + 5000;
-    Serial.println("AIS disconnected");
-  } else {
-    int guard = 4096;
-    while (aisSock && aisSock->available() && guard-- > 0) {
-      int c = aisSock->read();
-      if (c < 0) break;
-      wsBuf += (char)c;
-      aisLastRxMs = now;
-      if (wsBuf.length() > 16384) { aisStopReq = true; aisSockUp = false; aisOnline = false; break; }
-    }
-    if (aisSockUp) wsProcess();
-    if (aisSockUp && now - aisLastRxMs > 120000) {
-      aisStopReq = true; aisSockUp = false; aisOnline = false;
-      aisNextTryMs = now + 5000;
-    }
-    // If the confirmation never comes back, resend the subscription
-    // (the server treats a resend as a harmless replacement).
-    if (aisSockUp && !aisSubConfirmed && now - aisLastSubMs > 10000)
-      aisSubSendReq = true;   // v165N: sent by the Core 0 task
-    static uint32_t lastPingMs = 0;
-    if (aisSockUp && now - lastPingMs > 30000) {
-      lastPingMs = now;
-      aisPingReq = true;   // v165N: keepalive ping, sent by the Core 0 task
-    }
-  }
-}
-
 // ---------------- touch ----------------
 static uint32_t lastTouchMs = 0;
 
@@ -4980,7 +4600,7 @@ static void switchMode(int m) {
   // S3 v16: arriving on a screen starts its update at once
   // instead of waiting out the interval / retry backoff.
   if (m == 1) lastAcFetchMs = 0;
-  if (m == 2) aisNextTryMs = 0;
+  if (m == 2) aisSnapReq = true;   // S3 v27: snapshot poll at once on arrival
   curMap = MODE_MAP[m];
   selected = -1;
   selAcFlight[0] = 0;
@@ -5262,6 +4882,73 @@ static void touchLoop() {
   handleTouch(mx, my);
 }
 
+// ---- S3 v24: on-demand LAN portal (BOOT long-press) ------------------
+// Normal operation runs with the config server and mDNS stopped.
+// Holding BOOT (GPIO0) for 2 s starts the portal and shows this
+// screen; APRS/AIS reception keeps running behind it, touch is
+// ignored while it is up. BOOT 2 s again closes it, and so does
+// 5 min without a page access (handleRoot/save/mapgen refresh
+// portalLastActivityMs). Saving or a map remake reboots as before.
+static void drawRuntimePortalScreen() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setFont(&fonts::Font2);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(10, 12);
+  tft.print("SETUP PORTAL ON");
+  tft.setFont(&fonts::Font0);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(10, 48);  tft.print("Open in browser:");
+  tft.setCursor(22, 64);  tft.print("http://aprs-map.local");
+  tft.setCursor(22, 80);  tft.printf("or http://%s", WiFi.localIP().toString().c_str());
+  tft.setCursor(10, 110); tft.print("Hold BOOT 2s: close portal");
+  tft.setCursor(10, 126); tft.print("Auto off after 5 min idle");
+}
+
+static void startRuntimePortal() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("setup portal: WiFi not connected, not starting");
+    return;
+  }
+  startConfigServer();
+  beginMdns();
+  runtimePortalActive = true;
+  drawRuntimePortalScreen();
+  Serial.printf("setup portal: ON (http://aprs-map.local / http://%s)\n",
+                WiFi.localIP().toString().c_str());
+}
+
+static void stopRuntimePortal() {
+  stopConfigServer();
+  endMdns();
+  runtimePortalActive = false;
+  fullRedraw = true;
+  Serial.println("setup portal: OFF");
+}
+
+static void runtimePortalLoop() {
+  static uint32_t bootLowStartMs = 0;
+  static bool bootHandled = false;
+  uint32_t now = millis();
+  if (digitalRead(0) == LOW) {
+    if (!bootLowStartMs) bootLowStartMs = now;
+    if (!bootHandled && now - bootLowStartMs >= 2000) {
+      bootHandled = true;
+      if (runtimePortalActive) stopRuntimePortal();
+      else startRuntimePortal();
+    }
+  } else {
+    bootLowStartMs = 0;
+    bootHandled = false;
+  }
+  if (runtimePortalActive) {
+    if (WiFi.status() != WL_CONNECTED) stopRuntimePortal();
+    else if (now - portalLastActivityMs > 300000) {
+      Serial.println("setup portal: idle 5 min, auto off");
+      stopRuntimePortal();
+    }
+  }
+}
+
 // ---------------- setup / loop ----------------
 void setup() {
   Serial.begin(115200);
@@ -5284,7 +4971,7 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-  tft.print("APRS Map Viewer S3 v22");
+  tft.print("APRS Map Viewer S3 v28");
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -5375,7 +5062,6 @@ void setup() {
   chunkMutex = xSemaphoreCreateMutex();
   tlsReserveRetake();   // v130, v162N guarded
   Serial.printf("tls reserve: %s\n", tlsReserve ? "ok" : "FAILED");
-  Serial.println("AIS: plain stream (no deflate, no inflate buffer)");   // v149N
   xTaskCreatePinnedToCore(acFetchTask, "acFetch", 24576, nullptr, 1, nullptr, 0);
   // S3 v5: the frame is composed into TWO permanent half buffers.
   // A single 240-row block (153,600 B) NEVER exists on this heap
@@ -5420,9 +5106,10 @@ void setup() {
 static uint32_t lastBarMs = 0, lastPurgeMs = 0, lastSdRetryMs = 0, lastStationRedrawMs = 0;
 static uint32_t lastMobileDrawMs = 0, lastMobileCheckMs = 0;
 void loop() {
-  if (cfgServerStarted) cfgServer.handleClient();   // LAN reconfigure page
+  if (cfgServerRunning) cfgServer.handleClient();   // S3 v24: only while a portal is up
+  runtimePortalLoop();   // S3 v24: BOOT 2 s toggles the LAN portal
   aprsLoop();
-  aisLoop();
+  if (runtimePortalActive) { delay(10); return; }   // portal screen stays up; reception continues
   touchLoop();
   uint32_t now = millis();
   // S3 v15 (user idea): no ADS-B fetches while the FLIGHT screen
@@ -5432,6 +5119,15 @@ void loop() {
     lastAcFetchMs = now;
     acFetchedOnce = true;
     acFetchReq = true;   // v104: fetched on Core 0, touch stays live
+  }
+  // S3 v27: AIS ships come only from the Open Waters snapshot -
+  // poll every 60 s while the AIS screen is shown and merge into
+  // the ship table. No API key needed.
+  if ((cfgScreens & 4) && screenMode == 2 && WiFi.status() == WL_CONNECTED) {
+    if (now - aisLastSnapMs >= 60000) {
+      aisLastSnapMs = now;
+      aisSnapReq = true;   // fetched on Core 0, touch stays live
+    }
   }
   if (acDataReady) { acDataReady = false; acDropStationary(); acTrailsUpdate(); stationsDirty = true; }   // S3 v20: trail points per fetch; S3 v21: stationary drop first
   // S3 v14: heap-death self-recovery. On this board the pool
@@ -5446,12 +5142,10 @@ void loop() {
   // conditions at once.
   {
     static uint32_t heapDeadSince = 0;
-    // S3 v17: "dead" must mean TLS is actually unusable - the
-    // reserve is spent and the hole is small WHILE a stream is
-    // up is a healthy state (v16 log: connected, ships flowing,
-    // 'tls reserve: FAILED'), so exclude aisOnline and require
-    // 10 min without any TLS success.
-    bool heapDead = !tlsReserve && !aisOnline &&
+    // S3 v27: the v17 aisOnline exclusion went with the stream;
+    // with no persistent TLS session, reserve-gone + small hole +
+    // 10 min without any TLS success is simply dead.
+    bool heapDead = !tlsReserve &&
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < 40960 &&
       now - lastTlsOkMs > 600000UL;
     if (heapDead && WiFi.status() == WL_CONNECTED) {

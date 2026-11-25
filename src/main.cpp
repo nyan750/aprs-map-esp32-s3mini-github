@@ -399,7 +399,37 @@ static void freeMapChunk() {
   if (mapChunk2) { free(mapChunk2); mapChunk2 = nullptr; }
   if (chunkMutex) xSemaphoreGive(chunkMutex);
 }
+// S3 v30: screen geometry. The 2.8" builds are 320x240 landscape;
+// the 3.5" ILI9488 build (LCD35) is 480x320. All screen-relative
+// drawing goes through SCR_W / SCR_H; the stored map stays 640x480.
+#ifdef LCD35
+#define SCR_W 480
+#define SCR_H 320
+#else
+#define SCR_W 320
+#define SCR_H 240
+#endif
+// How this module wants pushImage RGB565 packed. The 2.8" module
+// byte-swaps. On the 3.5" ILI9488 the 565 push path itself is
+// unusable for map colours (LGFX's 565->888 conversion renders
+// pale mid-tones pink on this module; LCD35 diag v2-v7), so the
+// LCD35 build keeps STANDARD 565 internally and pushMap565
+// converts map pixels to RGB888 at push time instead.
+#ifndef LCD35
+#define PANEL_PUSH_SWAP 1
+#endif
+static inline uint16_t panelPack565(uint16_t v) {
+#ifdef PANEL_PUSH_SWAP
+  return (uint16_t)((v << 8) | (v >> 8));
+#else
+  return v;
+#endif
+}
+#ifdef LCD35
+#define MAP_CHUNK_ROWS 40    // 480 x 40 x 2 = 38,400 B - same bytes as 320 x 60
+#else
 #define MAP_CHUNK_ROWS 60
+#endif
 // S3 v2: the render chunk is sized dynamically - drawMap first tries
 // a FULL frame (240 rows, 153,600 B) so the whole map is composed in
 // RAM while the old frame stays on screen, then pushed in ONE
@@ -469,6 +499,17 @@ static void fetchAircraftDo();
 static void fetchAircraft() {
   if (tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
   fetchAircraftDo();
+  tlsReserveRetake();
+}
+// S3 v38: the AIS snapshot gets the same escrow treatment. It
+// used to handshake from the ambient pool while the 56 KB reserve
+// sat idle - on the 2.8" build the ambient pool was just big
+// enough, but on the 480-wide LCD35 build it is not (snapshot
+// start log: largest 21492, 'SSL - Memory allocation failed',
+// ships expire after 30 min and the AIS screen empties).
+static void fetchAisSnapshot() {
+  if (tlsReserve) { free(tlsReserve); tlsReserve = nullptr; }
+  fetchAisSnapshotDo();
   tlsReserveRetake();
 }
 // S3 v23 (user request): two ADS-B sources. adsb.lol is primary,
@@ -641,7 +682,7 @@ static void acFetchTask(void* arg) {
                     tlsReserve ? "ok" : "FAILED", (unsigned)tlsReserveBytes);
     }
     if (acFetchReq) { acFetchReq = false; acFetchBusy = true; fetchAircraft(); acFetchBusy = false; }
-    if (aisSnapReq) { aisSnapReq = false; acFetchBusy = true; fetchAisSnapshotDo(); acFetchBusy = false; }
+    if (aisSnapReq) { aisSnapReq = false; acFetchBusy = true; fetchAisSnapshot(); acFetchBusy = false; }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -907,7 +948,7 @@ static bool   sdOk = false;
 // the BMP starts at source pixel (vRectX0, vRectY0), is vSrcW x vSrcH
 // source px in size, and lands on screen at offset (vXOff, vYOff) -
 // non-zero when the whole map fits with margins (e.g. 640x320 on 320x240).
-static double vScale = 1, vRectX0 = 0, vRectY0 = 0, vSrcW = 320, vSrcH = 240;
+static double vScale = 1, vRectX0 = 0, vRectY0 = 0, vSrcW = SCR_W, vSrcH = SCR_H;
 static int    vXOff = 0, vYOff = 0;
 static double vRectWest = 0, vRectNorth = 0;   // geo at the visible rect's top-left
 static double vPxPerLon = 1, vPxPerLat = 1;    // screen px per degree
@@ -2142,8 +2183,8 @@ static BmpInfo bmpInfo[MAP_COUNT];
 static void computeView() {
   const MapDef& m = MAP_LIST[curMap];
   const BmpInfo& bi = bmpInfo[curMap];
-  int w = bi.ok ? bi.w : 320;
-  int h = bi.ok ? bi.h : 240;
+  int w = bi.ok ? bi.w : SCR_W;
+  int h = bi.ok ? bi.h : SCR_H;
   // v116: ONE zoom table for all screens - the map was unified in
   // v103, and the user expects the display (zoom steps and scale
   // labels) to be identical on APRS / FLIGHT / AIS too. Before, the
@@ -2157,14 +2198,23 @@ static void computeView() {
   // toggle is retired).
   // S3 v9 (= 028 v186N): SIX steps (user request): x2.5 and
   // x3.0 added.
+#ifdef LCD35
+  // S3 v30: on 480x320 the whole 640x480 map fits at x2/3.
+  // S3 v35: the fit step is x0.75 (cover) instead - at x2/3 the
+  // 4:3 map on the 3:2 screen left ~27 px black bands on both
+  // sides (user report). x0.75 fills the width exactly; ~27
+  // source rows are cropped at the top and bottom edges instead.
+  static const double APRS_SCALES[6] = {0.75, 1.0, 1.5, 2.0, 2.5, 3.0};
+#else
   static const double APRS_SCALES[6] = {0.5, 1.0, 1.5, 2.0, 2.5, 3.0};
+#endif
   int li = zoomLevel; if (li < 0) li = 0; if (li > 5) li = 5;
   double s = APRS_SCALES[li];
   vScale = s;
-  vSrcW = 320.0 / s; if (vSrcW > w) vSrcW = w;
-  vSrcH = 240.0 / s; if (vSrcH > h) vSrcH = h;
-  vXOff = (int)lround((320 - vSrcW * s) / 2);
-  vYOff = (int)lround((240 - vSrcH * s) / 2);
+  vSrcW = SCR_W / s; if (vSrcW > w) vSrcW = w;
+  vSrcH = SCR_H / s; if (vSrcH > h) vSrcH = h;
+  vXOff = (int)lround((SCR_W - vSrcW * s) / 2);
+  vYOff = (int)lround((SCR_H - vSrcH * s) / 2);
   double cxPx = (centerLon - m.west) / (m.east - m.west) * w;
   double cyPx = (m.north - centerLat) / (m.north - m.south) * h;
   vRectX0 = cxPx - vSrcW / 2; if (vRectX0 < 0) vRectX0 = 0; if (vRectX0 > w - vSrcW) vRectX0 = w - vSrcW;
@@ -2177,12 +2227,12 @@ static void computeView() {
 
 static double viewLatSpan() {
   computeView();
-  int h = bmpInfo[curMap].ok ? bmpInfo[curMap].h : 240;
+  int h = bmpInfo[curMap].ok ? bmpInfo[curMap].h : SCR_H;
   return vSrcH / h * (MAP_LIST[curMap].north - MAP_LIST[curMap].south);
 }
 static double viewLonSpan() {
   computeView();
-  int w = bmpInfo[curMap].ok ? bmpInfo[curMap].w : 320;
+  int w = bmpInfo[curMap].ok ? bmpInfo[curMap].w : SCR_W;
   return vSrcW / w * (MAP_LIST[curMap].east - MAP_LIST[curMap].west);
 }
 
@@ -2190,7 +2240,7 @@ static bool geoToPx(double lat, double lon, int& px, int& py) {
   computeView();
   px = vXOff + (int)lround((lon - vRectWest) * vPxPerLon);
   py = vYOff + (int)lround((vRectNorth - lat) * vPxPerLat);
-  return px >= -20 && px < 340 && py >= -20 && py < 260;
+  return px >= -20 && px < SCR_W + 20 && py >= -20 && py < SCR_H + 20;
 }
 
 // Startup/reset zoom: the whole map fitted to the screen (level 0), so
@@ -2202,7 +2252,7 @@ static int defaultZoomLevel() {
   return 0;   // v171N: every screen opens at x0.5 (user request)
 }
 
-static uint16_t rowPixBuf[320];
+static uint16_t rowPixBuf[SCR_W];
 
 // ---- flicker-free composition ---------------------------------------
 // A full-frame 16-bit sprite needs 153,600 B, more than this board's
@@ -2227,7 +2277,9 @@ static bool tapShown = false;
 // ended inside it were lost - "touch takes a long time to respond").
 static bool pendingTap = false;
 static int pendingTapX = 0, pendingTapY = 0;
+#ifndef BUTTON_UI
 static void captureTouchDuringRender();   // defined by touchLoop
+#endif
 
 // (mapChunk is declared with the aircraft globals - fetchAircraft frees it)
 static int chunkY0 = 0, chunkRows = 0;
@@ -2237,13 +2289,50 @@ static int chunkY0 = 0, chunkRows = 0;
 // swaps the whole frame within ~30 ms instead of sweeping.
 static bool emitTwo = false;
 static uint16_t* emitTarget = nullptr;
+
+// S3 v33 (LCD35 only): push map pixels as RGB888. The 3.5" module
+// renders 565 pushes with wrong mid-tones (pale colours go pink)
+// through LGFX's 565->888 conversion, while 888 pushes are
+// faithful (diag v7: gray stayed gray, sea stayed blue). Source
+// pixels are STANDARD 565 (panelPack565 is identity here). The
+// conversion stages through a small dedicated buffer, pushed in
+// <=8-row slices; if it cannot be allocated, fall back to the 565
+// push (wrong colours, still a map).
+#ifdef LCD35
+static uint8_t* mapStage888 = nullptr;
+static void pushMap565(int x, int y, int w, int h, const uint16_t* src) {
+  if (!mapStage888)
+    mapStage888 = (uint8_t*)heap_caps_malloc(SCR_W * 8 * 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  if (!mapStage888) { G->pushImage(x, y, w, h, src); return; }
+  for (int r0 = 0; r0 < h; r0 += 8) {
+    int n = min(8, h - r0);
+    uint8_t* d = mapStage888;
+    for (int i = 0; i < w * n; i++) {
+      uint16_t v = src[(size_t)r0 * w + i];
+      uint16_t r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+      // lgfx::rgb888_t stores b,g,r in memory order - write the
+      // bytes in THAT order (v33 wrote r,g,b and the sea came out
+      // orange).
+      *d++ = (uint8_t)((b5 << 3) | (b5 >> 2));
+      *d++ = (uint8_t)((g6 << 2) | (g6 >> 4));
+      *d++ = (uint8_t)((r5 << 3) | (r5 >> 2));
+    }
+    G->pushImage(x, y + r0, w, n, (lgfx::rgb888_t*)mapStage888);
+  }
+}
+#else
+static inline void pushMap565(int x, int y, int w, int h, const uint16_t* src) {
+  G->pushImage(x, y, w, h, src);
+}
+#endif
+
 static void emitLine(int y) {
   if (emitTwo) {
-    memcpy(emitTarget + (size_t)chunkRows * 320, rowPixBuf, 320 * 2);
+    memcpy(emitTarget + (size_t)chunkRows * SCR_W, rowPixBuf, SCR_W * 2);
     chunkRows++;
-    if (y == 239) {
-      G->pushImage(0, 0, 320, mapSplitRow, mapChunk);
-      G->pushImage(0, mapSplitRow, 320, 240 - mapSplitRow, mapChunk2);
+    if (y == SCR_H - 1) {
+      pushMap565(0, 0, SCR_W, mapSplitRow, mapChunk);
+      pushMap565(0, mapSplitRow, SCR_W, SCR_H - mapSplitRow, mapChunk2);
       chunkRows = 0;
     } else if (y == mapSplitRow - 1) {
       emitTarget = mapChunk2;
@@ -2251,12 +2340,12 @@ static void emitLine(int y) {
     }
     return;
   }
-  if (!mapChunk) { G->pushImage(0, y, 320, 1, rowPixBuf); return; }
+  if (!mapChunk) { pushMap565(0, y, SCR_W, 1, rowPixBuf); return; }
   if (chunkRows == 0) chunkY0 = y;
-  memcpy(mapChunk + (size_t)chunkRows * 320, rowPixBuf, 320 * 2);
+  memcpy(mapChunk + (size_t)chunkRows * SCR_W, rowPixBuf, SCR_W * 2);
   chunkRows++;
-  if (chunkRows == mapChunkRowsCap || y == 239) {
-    G->pushImage(0, chunkY0, 320, chunkRows, mapChunk);
+  if (chunkRows == mapChunkRowsCap || y == SCR_H - 1) {
+    pushMap565(0, chunkY0, SCR_W, chunkRows, mapChunk);
     chunkRows = 0;
   }
 }
@@ -2293,7 +2382,7 @@ static inline bool mapCoastAt(int sx, int sy) {
 // the baked blank-map data: 65% / 43% sea, no leaks). The fill
 // runs once per map/source change; the renderer then only tests
 // the mask - pale blue inside, black outside.
-static const uint16_t SEA_BLUE = (uint16_t)__builtin_bswap16(
+static const uint16_t SEA_BLUE = panelPack565(
     (uint16_t)(((80 & 0xF8) << 8) | ((115 & 0xFC) << 3) | (145 >> 3)));
 // v167N: sea darkened to ~60% (135,190,235 -> 80,115,145) - the
 // pale sea was what made the whole map read bright (user).
@@ -2312,7 +2401,7 @@ static const uint8_t* seaMaskFailSrc = nullptr;  // never retry per frame
 // v101: the line colour is the pre-v83 border GREEN (0,215,0) - white
 // read too faint on this panel (user report). Stored byte-swapped
 // like SEA_BLUE, for the 024 pushImage path.
-static const uint16_t BORDER_GREEN = 0x4005;   // v167N: (0,170,0) dimmed with the sea, byte-swapped
+static const uint16_t BORDER_GREEN = panelPack565(0x0540);   // v167N: (0,170,0) dimmed with the sea, panel-packed
 static inline bool seaMaskBit(int sx, int sy);   // defined just below
 static inline bool seaNearAt(int sx, int sy) {
   if (!seaMask) return false;
@@ -2334,7 +2423,7 @@ static inline bool inkLineAt(int sx, int sy) {   // unthinned line eligibility
   if (!mapCoastAt(sx, sy)) return true;
   // v108: coast-CLASS ink far from the real sea is a border / river
   // line misclassified at generation time - inland water (irrigation
-  // irrigation ponds, rivers) puts 'sea' bits all over the plain, so
+  // ponds, rivers) puts 'sea' bits all over the plain, so
   // most plain borders came out coast-class and were drawn black.
   // Only ink actually touching the sea mask is a true coastline:
   // keep that black, draw the rest green. Render-side only.
@@ -2637,7 +2726,7 @@ static inline void colorUnpack(uint16_t stored, int& r, int& g, int& b) {
 }
 static inline uint16_t colorPack(int r, int g, int b) {
   uint16_t v = (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
-  return (uint16_t)((v << 8) | (v >> 8));
+  return panelPack565(v);
 }
 static inline uint16_t colorPxStored(int sx, int sy) {
   uint16_t v;
@@ -2752,13 +2841,13 @@ static void drawMap() {
   // handshake keeps both the escrow hole and the chunk's block.
   if (!mapChunk && !acFetchBusy) {
     // S3 v2: full frame first (see mapChunkRowsCap note above).
-    static const int caps[3] = { 240, 120, MAP_CHUNK_ROWS };
+    static const int caps[3] = { SCR_H, SCR_H / 2, MAP_CHUNK_ROWS };
     for (int ci = 0; ci < 3 && !mapChunk; ci++) {
-      mapChunk = (uint16_t*)heap_caps_malloc(320 * caps[ci] * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+      mapChunk = (uint16_t*)heap_caps_malloc(SCR_W * caps[ci] * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
       if (mapChunk) {
         mapChunkRowsCap = caps[ci];
         Serial.printf("render chunk: %d rows (%u B), largest DMA %u\n", caps[ci],
-                      (unsigned)(320 * caps[ci] * sizeof(uint16_t)),
+                      (unsigned)(SCR_W * caps[ci] * sizeof(uint16_t)),
                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
       }
     }
@@ -2774,17 +2863,17 @@ static void drawMap() {
   // S3 v5: per-column source ranges for the fast colour path
   // (colorAt recomputed these with 4 software double divisions for
   // EVERY pixel - a large slice of the ~1,090 ms render).
-  static int colSrcX0[320], colSrcX1[320];
+  static int colSrcX0[SCR_W], colSrcX1[SCR_W];
   bool colorFast = (genColorActive && vScale <= 1.0);
   if (colorFast) {
-    for (int ix = 0; ix < 320; ix++) {
+    for (int ix = 0; ix < SCR_W; ix++) {
       int xs = (int)(vRectX0 + ix / vScale); if (xs < 0) xs = 0; if (xs >= MAP_W) xs = MAP_W - 1;
       int xe = (int)(vRectX0 + (ix + 1) / vScale); if (xe <= xs) xe = xs + 1; if (xe > MAP_W) xe = MAP_W;
       colSrcX0[ix] = xs; colSrcX1[ix] = xe;
     }
   }
   // S3 v5: two-buffer compose arms here (both halves permanent).
-  emitTwo = (mapChunk && mapChunk2 && mapSplitRow > 0 && mapSplitRow < 240);
+  emitTwo = (mapChunk && mapChunk2 && mapSplitRow > 0 && mapSplitRow < SCR_H);
   emitTarget = mapChunk;
   uint32_t t0 = millis();
   // v112: no frame-long startWrite transaction. Each chunk push is
@@ -2792,17 +2881,19 @@ static void drawMap() {
   // returns only after its transfer completes), so the bus is free
   // between pushes and the touch panel can be polled mid-render.
   chunkRows = 0;
-  for (int y = 0; y < 240; y++) {
+  for (int y = 0; y < SCR_H; y++) {
+#ifndef BUTTON_UI
     if (y && (y & 31) == 0) captureTouchDuringRender();
+#endif
     int iy = y - vYOff;
     if (iy < 0 || iy >= vImgRows) {                 // letterbox margin
-      for (int x = 0; x < 320; x++) rowPixBuf[x] = 0;
+      for (int x = 0; x < SCR_W; x++) rowPixBuf[x] = 0;
       emitLine(y);
       continue;
     }
     if (smooth) {
       if (genColorActive) {   // v128: stored colour image
-        for (int x = 0; x < 320; x++) {
+        for (int x = 0; x < SCR_W; x++) {
           int ix = x - vXOff;
           rowPixBuf[x] = (ix < 0 || ix >= vImgCols) ? 0 : colorAt(ix, iy);
         }
@@ -2813,7 +2904,7 @@ static void drawMap() {
       int sy0 = (int)srcYf; if (sy0 < 0) sy0 = 0; if (sy0 >= MAP_H) sy0 = MAP_H - 1;
       int sy1 = min(sy0 + 1, MAP_H - 1);
       double fy = srcYf - floor(srcYf); if (fy < 0) fy = 0;
-      for (int x = 0; x < 320; x++) {
+      for (int x = 0; x < SCR_W; x++) {
         int ix = x - vXOff;
         if (ix < 0 || ix >= vImgCols) { rowPixBuf[x] = 0; continue; }
         double srcXf = vRectX0 + ix / vScale;
@@ -2839,7 +2930,7 @@ static void drawMap() {
       // direct row reads (was ~1,090 ms per render on-device).
       int ys = (int)(vRectY0 + iy / vScale); if (ys < 0) ys = 0; if (ys >= MAP_H) ys = MAP_H - 1;
       int ye = (int)(vRectY0 + (iy + 1) / vScale); if (ye <= ys) ye = ys + 1; if (ye > MAP_H) ye = MAP_H;
-      for (int x = 0; x < 320; x++) {
+      for (int x = 0; x < SCR_W; x++) {
         int ix = x - vXOff;
         if (ix < 0 || ix >= vImgCols) { rowPixBuf[x] = 0; continue; }
         int xs = colSrcX0[ix], xe = colSrcX1[ix];
@@ -2866,7 +2957,7 @@ static void drawMap() {
     }
     int ys = (int)(vRectY0 + iy / vScale); if (ys < 0) ys = 0; if (ys >= MAP_H) ys = MAP_H - 1;
     int ye = (int)(vRectY0 + (iy + 1) / vScale); if (ye <= ys) ye = ys + 1; if (ye > MAP_H) ye = MAP_H;
-    for (int x = 0; x < 320; x++) {
+    for (int x = 0; x < SCR_W; x++) {
       int ix = x - vXOff;
       if (ix < 0 || ix >= vImgCols) { rowPixBuf[x] = 0; continue; }
       int xs = (int)(vRectX0 + ix / vScale); if (xs < 0) xs = 0; if (xs >= MAP_W) xs = MAP_W - 1;
@@ -2913,7 +3004,7 @@ static void layoutBar() {
   // [-] [+] buttons at the top-right - [-] is drawn at x=268, so
   // LIST (38 wide) ends 4 px before it. The status text fills
   // the space between the last tab and LIST.
-  barListX = 268 - 4 - 38;
+  barListX = (SCR_W - 52) - 4 - 38;
   barStatusX = x + 2;
 }
 static void drawBarF(bool force, bool push) {
@@ -2946,7 +3037,7 @@ static void drawBarF(bool force, bool push) {
   }
   strcpy(lastBarLeft, leftKey);
   strcpy(lastBarMid, mid);
-  G->fillRect(0, 0, 320, BAR_H, TFT_NAVY);
+  G->fillRect(0, 0, SCR_W, BAR_H, TFT_NAVY);
   // screen tabs: the visible screens only (v175N), packed from
   // the left - the active one is filled white
   G->setFont(&fonts::Font0);
@@ -2975,10 +3066,10 @@ static void drawBarF(bool force, bool push) {
   G->print(mid);
   G->drawRect(barListX, 2, 38, 18, TFT_WHITE);
   G->setCursor(barListX + 6, 7); G->print("LIST");
-  G->drawRect(268, 2, 24, 18, TFT_WHITE);
-  G->setCursor(277, 7); G->print("-");
-  G->drawRect(294, 2, 24, 18, TFT_WHITE);
-  G->setCursor(303, 7); G->print("+");
+  G->drawRect(SCR_W - 52, 2, 24, 18, TFT_WHITE);
+  G->setCursor(SCR_W - 43, 7); G->print("-");
+  G->drawRect(SCR_W - 26, 2, 24, 18, TFT_WHITE);
+  G->setCursor(SCR_W - 17, 7); G->print("+");
   if (push && sprOk) spr.pushSprite(0, 0);
 }
 static void drawBar() { drawBarF(true, true); }
@@ -3029,7 +3120,7 @@ static void drawStations() {
     if (!stations[i].used) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; continue; }
     if (!geoToPx(stations[i].lat, stations[i].lon, px, py)) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; continue; }
     if (py < BAR_H + 4) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; continue; }
-    if (px < 0 || px >= 320) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; continue; }   // label would float marker-less
+    if (px < 0 || px >= SCR_W) { snapUsed[i] = false; snapTrailCntD[i] = 0; snapMoving[i] = false; continue; }   // label would float marker-less
     bool sel = (i == selected);
     // v184N: a station with a live track (>= 2 points, >= 100 m of
     // travel inside the last 10 min) is a moving station: red
@@ -3256,7 +3347,7 @@ static void drawAircraft() {
   for (int i = 0; i < acCount; i++) {
     if (!geoToPx(aircraft[i].lat, aircraft[i].lon, px, py)) { snapAcPx[i] = -1; continue; }
     if (py < BAR_H + 4) { snapAcPx[i] = -1; continue; }
-    if (px < 0 || px >= 320) { snapAcPx[i] = -1; continue; }   // same label-spill fix
+    if (px < 0 || px >= SCR_W) { snapAcPx[i] = -1; continue; }   // same label-spill fix
     bool sel = detailIsAc && !strcmp(aircraft[i].flight, selAcFlight);
     bool selBefore = snapDetailIsAc && !strcmp(aircraft[i].flight, snapSelAcFlight);
     // v78: skip-unchanged (position, flight, TRACK, selection) - the
@@ -3340,7 +3431,7 @@ static void drawShips() {
     if (!ships[i].used || !ships[i].hasPos) { snapShipPx[i] = -1; continue; }
     if (!geoToPx(ships[i].lat, ships[i].lon, px, py)) { snapShipPx[i] = -1; continue; }
     if (py < BAR_H + 4) { snapShipPx[i] = -1; continue; }
-    if (px < 0 || px >= 320) { snapShipPx[i] = -1; continue; }   // same label-spill fix
+    if (px < 0 || px >= SCR_W) { snapShipPx[i] = -1; continue; }   // same label-spill fix
     char label[24];
     if (ships[i].name[0]) strncpy(label, ships[i].name, sizeof(label) - 1);
     else snprintf(label, sizeof(label), "%lu", (unsigned long)ships[i].mmsi);
@@ -3394,11 +3485,15 @@ static void drawShips() {
 
 // ◀ ▶ ▲ ▼ hints at the screen edges while zoomed in (the pan tap zones)
 static void drawPanHints() {
+#ifdef BUTTON_UI
+  return;   // S3 v37: no pan on the button build, so the edge
+            // triangles are meaningless there - removed (user request)
+#endif
   if (zoomLevel <= 0) return;   // v117: pan hints at x1.0 (the zoomed step)
-  G->fillTriangle(8, 120, 2, 112, 2, 128, TFT_BLACK);   // v174N: black (user: silver was hard to see on the pale map)
-  G->fillTriangle(311, 120, 317, 112, 317, 128, TFT_BLACK);
-  G->fillTriangle(160, BAR_H + 3, 152, BAR_H + 13, 168, BAR_H + 13, TFT_BLACK);
-  G->fillTriangle(160, 237, 152, 227, 168, 227, TFT_BLACK);
+  G->fillTriangle(8, SCR_H / 2, 2, SCR_H / 2 - 8, 2, SCR_H / 2 + 8, TFT_BLACK);   // v174N: black (user: silver was hard to see on the pale map)
+  G->fillTriangle(SCR_W - 9, SCR_H / 2, SCR_W - 3, SCR_H / 2 - 8, SCR_W - 3, SCR_H / 2 + 8, TFT_BLACK);
+  G->fillTriangle(SCR_W / 2, BAR_H + 3, SCR_W / 2 - 8, BAR_H + 13, SCR_W / 2 + 8, BAR_H + 13, TFT_BLACK);
+  G->fillTriangle(SCR_W / 2, SCR_H - 3, SCR_W / 2 - 8, SCR_H - 13, SCR_W / 2 + 8, SCR_H - 13, TFT_BLACK);
 }
 
 // v184N: a station whose trail changed since it was drawn (new
@@ -3476,11 +3571,11 @@ static void drawAcDetail() {
   if (idx < 0) { detailOpen = false; detailIsAc = false; return; }
   const Aircraft& a = aircraft[idx];
   const RouteInfo* r = findRoute(a.flight);
-  G->fillRoundRect(8, 30, 304, 190, 6, 0x1082);   // dark slate
-  G->drawRoundRect(8, 30, 304, 190, 6, TFT_WHITE);
+  G->fillRoundRect(8, 30, SCR_W - 16, 190, 6, 0x1082);   // dark slate
+  G->drawRoundRect(8, 30, SCR_W - 16, 190, 6, TFT_WHITE);
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
-  G->setCursor(288, 34); G->print("X");
+  G->setCursor(SCR_W - 32, 34); G->print("X");
   G->setTextColor(TFT_GREEN, 0x1082);   // S3 v13: match the marker colour
   G->setCursor(16, 34);
   G->print(a.flight);
@@ -3515,11 +3610,11 @@ static void drawAcDetail() {
 static void drawShipDetail() {
   Ship* s = selShipMmsi ? findShip(selShipMmsi, false) : nullptr;
   if (!s || !s->hasPos) { detailOpen = false; return; }
-  G->fillRoundRect(8, 30, 304, 190, 6, 0x1082);   // dark slate
-  G->drawRoundRect(8, 30, 304, 190, 6, TFT_WHITE);
+  G->fillRoundRect(8, 30, SCR_W - 16, 190, 6, 0x1082);   // dark slate
+  G->drawRoundRect(8, 30, SCR_W - 16, 190, 6, TFT_WHITE);
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
-  G->setCursor(288, 34); G->print("X");
+  G->setCursor(SCR_W - 32, 34); G->print("X");
   G->setTextColor(TFT_CYAN, 0x1082);   // S3 v10: match the marker colour
   G->setCursor(16, 34);
   char title[28];
@@ -3562,11 +3657,11 @@ static void drawDetail() {
   if (detailIsAc) { drawAcDetail(); return; }
   if (selected < 0 || !stations[selected].used) { detailOpen = false; return; }
   const Station& s = stations[selected];
-  G->fillRoundRect(8, 30, 304, 190, 6, 0x1082);   // dark slate
-  G->drawRoundRect(8, 30, 304, 190, 6, TFT_WHITE);
+  G->fillRoundRect(8, 30, SCR_W - 16, 190, 6, 0x1082);   // dark slate
+  G->drawRoundRect(8, 30, SCR_W - 16, 190, 6, TFT_WHITE);
   G->setTextColor(TFT_RED, 0x1082);
   G->setFont(&fonts::Font2);
-  G->setCursor(288, 34); G->print("X");
+  G->setCursor(SCR_W - 32, 34); G->print("X");
   G->setTextColor(TFT_YELLOW, 0x1082);
   G->setCursor(16, 34);
   G->print(s.call);
@@ -3617,7 +3712,7 @@ static bool mapDirty = true;              // view changed -> re-render the map f
 static uint16_t* restoreChunk = nullptr;   // v78: dedicated 320x24 staging buffer (15,360 B)
 static void restoreMapRect(int x0, int y0, int x1, int y1) {
   if (x0 < 0) x0 = 0; if (y0 < BAR_H) y0 = BAR_H;
-  if (x1 > 319) x1 = 319; if (y1 > 239) y1 = 239;
+  if (x1 > SCR_W - 1) x1 = SCR_W - 1; if (y1 > SCR_H - 1) y1 = SCR_H - 1;
   if (x1 < x0 || y1 < y0) return;
   int w = x1 - x0 + 1;
   // v78: batched again, but NOT the way v76 did it. v76 staged into
@@ -3641,7 +3736,7 @@ static void restoreMapRect(int x0, int y0, int x1, int y1) {
   if (!restoreChunk) {   // allocation failed: v75 line-by-line fallback
     for (int y = y0; y <= y1; y++) {
       for (int x = x0; x <= x1; x++) rowPixBuf[x - x0] = mapPixelAt(x, y);
-      G->pushImage(x0, y, w, 1, rowPixBuf);
+      pushMap565(x0, y, w, 1, rowPixBuf);
     }
     return;
   }
@@ -3652,7 +3747,7 @@ static void restoreMapRect(int x0, int y0, int x1, int y1) {
     for (int r = 0; r < n; r++)
       for (int x = x0; x <= x1; x++)
         restoreChunk[r * w + (x - x0)] = mapPixelAt(x, y + r);
-    G->pushImage(x0, y, w, n, restoreChunk);
+    pushMap565(x0, y, w, n, restoreChunk);
     y += n;
   }
 }
@@ -3729,12 +3824,17 @@ static void repairMovedObjects() {
 
 static bool markerRepair = false;
 // ---- visible-object list (LIST button, both screens) ----------------
+#ifdef LCD35
+#define LIST_ROWS 16
+#else
 #define LIST_ROWS 11
+#endif
 #define LIST_Y0 (BAR_H + 26)
 #define LIST_ROWH 15
 static int listIdx[MAX_STATIONS + MAX_AC];
 static double listDist[MAX_STATIONS + MAX_AC];
 static int listCount = 0;
+static int listCursor = 0;   // S3 v29b: button-UI highlight row (absolute list index)
 
 static void buildList() {
   listCount = 0;
@@ -3775,20 +3875,20 @@ static void drawList() {
   int pages = max(1, (listCount + LIST_ROWS - 1) / LIST_ROWS);
   if (listPage >= pages) listPage = pages - 1;
   if (listPage < 0) listPage = 0;
-  G->fillRect(0, BAR_H, 320, 240 - BAR_H, 0x1082);
+  G->fillRect(0, BAR_H, SCR_W, SCR_H - BAR_H, 0x1082);
   G->setFont(&fonts::Font2);
   G->setTextColor(TFT_YELLOW, 0x1082);
   G->setCursor(10, BAR_H + 3);
   G->print(screenMode == 0 ? "APRS LIST" : (screenMode == 1 ? "FLIGHT LIST" : "SHIP LIST"));
   G->setTextColor(TFT_RED, 0x1082);
-  G->setCursor(294, BAR_H + 3);
+  G->setCursor(SCR_W - 26, BAR_H + 3);
   G->print("X");
   G->setFont(&fonts::Font0);
   if (listCount == 0) {
     G->setTextColor(TFT_WHITE, 0x1082);
     const char* msg = screenMode == 0 ? "NO STATIONS VISIBLE"
                     : (screenMode == 1 ? "NO AIRCRAFT VISIBLE" : "NO SHIPS VISIBLE");
-    G->setCursor((320 - G->textWidth(msg)) / 2, 120);
+    G->setCursor((SCR_W - G->textWidth(msg)) / 2, SCR_H / 2);
     G->print(msg);
   }
   int start = listPage * LIST_ROWS;
@@ -3796,7 +3896,13 @@ static void drawList() {
     int id = listIdx[start + r];
     int y = LIST_Y0 + r * LIST_ROWH;
     char right[40];
+#ifdef BUTTON_UI
+    bool cur = (start + r == listCursor);   // S3 v29b: cursor row
+    if (cur) G->fillRect(6, y - 1, SCR_W - 12, LIST_ROWH - 1, TFT_NAVY);
+    G->setTextColor(cur ? TFT_YELLOW : TFT_WHITE, cur ? TFT_NAVY : (uint32_t)0x1082);
+#else
     G->setTextColor(TFT_WHITE, 0x1082);
+#endif
     G->setCursor(10, y + 3);
     if (screenMode == 0) {
       G->print(stations[id].call);
@@ -3816,17 +3922,17 @@ static void drawList() {
       }
       snprintf(right, sizeof(right), "%.1f km  %.0f kn", listDist[start + r], ships[id].sog);
     }
-    G->setCursor(310 - G->textWidth(right), y + 3);
+    G->setCursor(SCR_W - 10 - G->textWidth(right), y + 3);
     G->print(right);
-    G->drawLine(8, y + LIST_ROWH - 2, 312, y + LIST_ROWH - 2, TFT_NAVY);
+    G->drawLine(8, y + LIST_ROWH - 2, SCR_W - 8, y + LIST_ROWH - 2, TFT_NAVY);
   }
   // paging footer
   G->setTextColor(TFT_WHITE, 0x1082);
-  if (listPage > 0) { G->setCursor(10, 226); G->print("< PREV"); }
-  if (listPage < pages - 1) { G->setCursor(268, 226); G->print("NEXT >"); }
+  if (listPage > 0) { G->setCursor(10, SCR_H - 14); G->print("< PREV"); }
+  if (listPage < pages - 1) { G->setCursor(SCR_W - 52, SCR_H - 14); G->print("NEXT >"); }
   char pc[12];
   snprintf(pc, sizeof(pc), "%d/%d", listPage + 1, pages);
-  G->setCursor((320 - G->textWidth(pc)) / 2, 226);
+  G->setCursor((SCR_W - G->textWidth(pc)) / 2, SCR_H - 14);
   G->print(pc);
 }
 
@@ -3868,7 +3974,7 @@ static void redraw() {
     // list close had no repaint path before v76 and left the slate
     // background on screen).
     if (prevList && !listOpen) {
-      restoreMapRect(0, BAR_H, 319, 239);   // the list covered everything
+      restoreMapRect(0, BAR_H, SCR_W - 1, SCR_H - 1);   // the list covered everything
       invalidateSnapshots();
     } else if (prevDetail && !detailOpen) {
       restoreMapRect(7, 29, 312, 220);      // v78: only the panel's own rect
@@ -3892,7 +3998,7 @@ static void redraw() {
     // repaint the left strip from the map too - no stale fragment
     // can survive there. Current markers redraw right after this.
     if (repairErased || (prevDetail && !detailOpen))
-      restoreMapRect(0, BAR_H, 47, 239);
+      restoreMapRect(0, BAR_H, 47, SCR_H - 1);
   }
   // v78: unchanged markers may be skipped only when nothing was
   // erased or repainted under them this frame.
@@ -4613,21 +4719,27 @@ static void switchMode(int m) {
 }
 
 // ---- list touch -------------------------------------------------------
+static void listActivate(int id);   // S3 v29b: defined below, shared with the button UI
 static void handleListTouch(int x, int y) {
   buildList();
   int pages = max(1, (listCount + LIST_ROWS - 1) / LIST_ROWS);
-  if (y >= 218) {   // paging footer
+  if (y >= SCR_H - 22) {   // paging footer
     if (x < 100 && listPage > 0) listPage--;
     else if (x >= 220 && listPage < pages - 1) listPage++;
     fullRedraw = true;
     return;
   }
-  if (y < LIST_Y0 - 4 && x >= 280) { listOpen = false; fullRedraw = true; return; }   // X
+  if (y < LIST_Y0 - 4 && x >= SCR_W - 40) { listOpen = false; fullRedraw = true; return; }   // X
   int row = (y - LIST_Y0) / LIST_ROWH;
   if (row < 0 || row >= LIST_ROWS) return;
   int idx = listPage * LIST_ROWS + row;
   if (idx >= listCount) return;
-  int id = listIdx[idx];
+  listActivate(listIdx[idx]);
+}
+
+// S3 v29b: shared by the touch list and the button list - centre
+// on the object and open its detail panel.
+static void listActivate(int id) {
   listOpen = false;
   if (zoomLevel < 1) zoomLevel = 1;   // so the centre move is visible
   if (screenMode == 0) {
@@ -4683,8 +4795,8 @@ static void handleTouch(int x, int y) {
     else if (barTabX[1] >= 0 && x >= barTabX[1] && x < barTabX[1] + barTabW[1]) switchMode(1);
     else if (barTabX[2] >= 0 && x >= barTabX[2] && x < barTabX[2] + barTabW[2]) switchMode(2);
     else if (x >= barListX && x < barListX + 39) { listOpen = true; listPage = 0; }
-    else if (x >= 258 && x < 291) { if (zoomLevel > 0) zoomLevel--; clampCenter(); }              // v171N: [-]
-    else if (x >= 292) { if (zoomLevel < maxZoomLevel()) zoomLevel++; clampCenter(); }            // v171N: [+]
+    else if (x >= SCR_W - 62 && x < SCR_W - 29) { if (zoomLevel > 0) zoomLevel--; clampCenter(); }              // v171N: [-]
+    else if (x >= SCR_W - 28) { if (zoomLevel < maxZoomLevel()) zoomLevel++; clampCenter(); }            // v171N: [+]
     else acted = false;
     if (acted) {
       mapDirty = true;
@@ -4764,10 +4876,10 @@ static void handleTouch(int x, int y) {
       if (zoomLevel < maxZoomLevel()) zoomLevel++;
       clampCenter();
     }
-  } else if (x < 48 || x >= 320 - 48 || y < BAR_H + 40 || y >= 240 - 48) {
+  } else if (x < 48 || x >= SCR_W - 48 || y < BAR_H + 40 || y >= SCR_H - 48) {
     // pan: tap any screen edge to shift the view a quarter screen that way
-    int dx = (x >= 320 - 48) ? 1 : (x < 48 ? -1 : 0);
-    int dy = (y >= 240 - 48) ? -1 : (y < BAR_H + 40 ? 1 : 0);
+    int dx = (x >= SCR_W - 48) ? 1 : (x < 48 ? -1 : 0);
+    int dy = (y >= SCR_H - 48) ? -1 : (y < BAR_H + 40 ? 1 : 0);
     centerLon += dx * viewLonSpan() * 0.25;
     centerLat += dy * viewLatSpan() * 0.25;
     clampCenter();
@@ -4781,6 +4893,7 @@ static void handleTouch(int x, int y) {
   fullRedraw = true;
 }
 
+#ifndef BUTTON_UI
 static uint32_t lastPollMs = 0;
 static bool touchWasDown = false;
 // v131: confirmed touch read. On the 024 the XPT2046 shares the
@@ -4881,14 +4994,199 @@ static void touchLoop() {
   lastTouchMs = now;
   handleTouch(mx, my);
 }
+#endif   // !BUTTON_UI
+
+#ifdef BUTTON_UI
+// ---- S3 v29b: 4-button UI for a non-touch LCD -------------------
+// Buttons to GND, internal pull-ups (active LOW):
+//   A = GPIO4 (FLIGHT)   B = GPIO5 (AIS)
+//   C = GPIO6 (APRS)     D = GPIO7 (next object / detail)
+// Normal : A/B/C short = screen (press again on the same screen =
+//          LIST), A long = zoom -, B long = zoom +, C long =
+//          previous object, D short = next object (centre + one
+//          zoom step), D long = detail on.
+// LIST   : A = up, B = down (hold to repeat), C = select, D = close.
+// Detail : any short press closes it; A/B/C also change screen.
+// BOOT (GPIO0) keeps its jobs: runtime portal and settings reset.
+#define BTN_LONG_MS 600
+static const uint8_t BTN_PINS[4] = {4, 5, 6, 7};
+static bool     btnDown[4]     = {false, false, false, false};
+static bool     btnLongDone[4] = {false, false, false, false};
+static uint32_t btnDownMs[4]   = {0, 0, 0, 0};
+static uint32_t btnRepMs[4]    = {0, 0, 0, 0};
+
+static void btnOpenList() {
+  buildList();
+  listOpen = true;
+  listPage = 0;
+  listCursor = 0;
+  fullRedraw = true;
+}
+
+// A screen button: a visible screen switches (or opens LIST when
+// already there); a hidden screen falls to the next visible one in
+// tab order (FLIGHT -> AIS -> APRS), like the M5 buttons.
+static void btnTabPress(int mode) {
+  static const int ORDER[3] = {1, 2, 0};
+  int pos = (mode == 1) ? 0 : (mode == 2) ? 1 : 2;
+  for (int k = 0; k < 3; k++) {
+    int cand = ORDER[(pos + k) % 3];
+    if (!((cfgScreens >> cand) & 1)) continue;
+    if (cand == screenMode) btnOpenList();
+    else switchMode(cand);
+    return;
+  }
+}
+
+static void btnZoom(int d) {
+  if (d < 0) { if (zoomLevel > 0) zoomLevel--; }
+  else       { if (zoomLevel < maxZoomLevel()) zoomLevel++; }
+  clampCenter();
+  mapDirty = true;
+  fullRedraw = true;
+}
+
+// Index (into stations[] / aircraft[] / ships[]) of the object
+// currently selected on this screen, or -1.
+static int btnSelectedId() {
+  if (screenMode == 0) return selected;
+  if (screenMode == 2) {
+    if (!selShipMmsi) return -1;
+    for (int i = 0; i < MAX_SHIPS; i++)
+      if (ships[i].used && ships[i].mmsi == selShipMmsi) return i;
+    return -1;
+  }
+  if (!selAcFlight[0]) return -1;
+  for (int i = 0; i < acCount; i++)
+    if (!strcmp(aircraft[i].flight, selAcFlight)) return i;
+  return -1;
+}
+
+// Centre on an object and select it (the touch first-tap
+// behaviour), optionally opening the detail panel.
+static void btnFocusObject(int id, bool openDetail) {
+  if (screenMode == 0) {
+    selected = id;
+    selAcFlight[0] = 0; detailIsAc = false;
+    centerLat = stations[id].lat;
+    centerLon = stations[id].lon;
+  } else if (screenMode == 2) {
+    selShipMmsi = ships[id].mmsi;
+    selected = -1; selAcFlight[0] = 0; detailIsAc = false;
+    centerLat = ships[id].lat;
+    centerLon = ships[id].lon;
+  } else {
+    strncpy(selAcFlight, aircraft[id].flight, sizeof(selAcFlight) - 1);
+    selAcFlight[sizeof(selAcFlight) - 1] = 0;
+    selected = -1; detailIsAc = true;
+    centerLat = aircraft[id].lat;
+    centerLon = aircraft[id].lon;
+    if (openDetail) ensureRoute(selAcFlight);
+  }
+  if (zoomLevel < maxZoomLevel()) zoomLevel++;
+  clampCenter();
+  detailOpen = openDetail;
+  mapDirty = true;
+  fullRedraw = true;
+}
+
+// Cycle the selection through this screen's objects in LIST order
+// (nearest first), wrapping around.
+static void btnCycleObject(int dir) {
+  buildList();
+  if (listCount == 0) return;
+  int curId = btnSelectedId();
+  int curPos = -1;
+  if (curId >= 0)
+    for (int i = 0; i < listCount; i++)
+      if (listIdx[i] == curId) { curPos = i; break; }
+  int next = (curPos < 0) ? (dir > 0 ? 0 : listCount - 1)
+                          : (curPos + dir + listCount) % listCount;
+  btnFocusObject(listIdx[next], false);
+}
+
+static void btnDetailToggle() {
+  int id = btnSelectedId();
+  if (id < 0) {   // nothing selected: take the nearest, with detail
+    buildList();
+    if (listCount == 0) return;
+    btnFocusObject(listIdx[0], true);
+    return;
+  }
+  if (screenMode == 1) ensureRoute(selAcFlight);
+  detailOpen = true;
+  fullRedraw = true;
+}
+
+static void btnListMove(int d) {
+  if (listCount == 0) return;
+  listCursor += d;
+  if (listCursor < 0) listCursor = 0;
+  if (listCursor >= listCount) listCursor = listCount - 1;
+  listPage = listCursor / LIST_ROWS;
+  fullRedraw = true;
+}
+
+static void btnAction(int i, bool isLong) {
+  if (listOpen) {
+    if (isLong) return;
+    if (i == 0) btnListMove(-1);
+    else if (i == 1) btnListMove(1);
+    else if (i == 2) { if (listCount > 0) listActivate(listIdx[listCursor]); }
+    else if (i == 3) { listOpen = false; fullRedraw = true; }
+    return;
+  }
+  if (detailOpen) {
+    if (isLong) return;
+    detailOpen = false;
+    fullRedraw = true;
+    if (i == 0 && screenMode != 1 && ((cfgScreens >> 1) & 1)) switchMode(1);
+    else if (i == 1 && screenMode != 2 && ((cfgScreens >> 2) & 1)) switchMode(2);
+    else if (i == 2 && screenMode != 0 && ((cfgScreens >> 0) & 1)) switchMode(0);
+    return;
+  }
+  if (i == 0) { if (isLong) btnZoom(-1); else btnTabPress(1); }              // A: FLIGHT
+  else if (i == 1) { if (isLong) btnZoom(1); else btnTabPress(2); }          // B: AIS
+  else if (i == 2) { if (isLong) btnCycleObject(-1); else btnTabPress(0); }  // C: APRS
+  else if (i == 3) { if (isLong) btnDetailToggle(); else btnCycleObject(1); }  // D
+}
+
+static void buttonsLoop() {
+  uint32_t now = millis();
+  for (int i = 0; i < 4; i++) {
+    bool down = digitalRead(BTN_PINS[i]) == LOW;
+    if (down && !btnDown[i]) {
+      btnDown[i] = true;
+      btnLongDone[i] = false;
+      btnDownMs[i] = now;
+      btnRepMs[i] = now;
+    } else if (down && btnDown[i]) {
+      // LIST cursor auto-repeat on A/B while held (no long action)
+      if (listOpen && (i == 0 || i == 1) && now - btnDownMs[i] > 450 &&
+          now - btnRepMs[i] >= 120) {
+        btnRepMs[i] = now;
+        btnListMove(i == 0 ? -1 : 1);
+      }
+      if (!btnLongDone[i] && now - btnDownMs[i] >= BTN_LONG_MS) {
+        btnLongDone[i] = true;
+        if (!(listOpen && (i == 0 || i == 1))) btnAction(i, true);
+      }
+    } else if (!down && btnDown[i]) {
+      btnDown[i] = false;
+      if (!btnLongDone[i] && now - btnDownMs[i] >= 25) btnAction(i, false);
+    }
+  }
+}
+#endif   // BUTTON_UI
 
 // ---- S3 v24: on-demand LAN portal (BOOT long-press) ------------------
 // Normal operation runs with the config server and mDNS stopped.
 // Holding BOOT (GPIO0) for 2 s starts the portal and shows this
 // screen; APRS/AIS reception keeps running behind it, touch is
-// ignored while it is up. BOOT 2 s again closes it, and so does
-// 5 min without a page access (handleRoot/save/mapgen refresh
-// portalLastActivityMs). Saving or a map remake reboots as before.
+// ignored while it is up. BOOT 2 s again closes it. S3 v39 (user
+// request): the 5-min idle auto-off is REMOVED - the portal stays
+// up until closed with BOOT (it kept expiring before the phone
+// could get in). Saving or a map remake reboots as before.
 static void drawRuntimePortalScreen() {
   tft.fillScreen(TFT_BLACK);
   tft.setFont(&fonts::Font2);
@@ -4897,30 +5195,42 @@ static void drawRuntimePortalScreen() {
   tft.print("SETUP PORTAL ON");
   tft.setFont(&fonts::Font0);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, 48);  tft.print("Open in browser:");
-  tft.setCursor(22, 64);  tft.print("http://aprs-map.local");
-  tft.setCursor(22, 80);  tft.printf("or http://%s", WiFi.localIP().toString().c_str());
-  tft.setCursor(10, 110); tft.print("Hold BOOT 2s: close portal");
-  tft.setCursor(10, 126); tft.print("Auto off after 5 min idle");
+  // S3 v40: AP mode, same as the first-time setup screen.
+  tft.setCursor(10, 48);  tft.print("1. Connect phone Wi-Fi to:");
+  tft.setCursor(22, 64);  tft.print("APRSMap-Setup");
+  tft.setCursor(10, 84);  tft.print("2. Open in browser:");
+  tft.setCursor(22, 100); tft.print("http://192.168.4.1");
+  tft.setCursor(10, 120); tft.print("(setup page may open by itself)");
+  tft.setCursor(10, 146); tft.print("Hold BOOT 2s: close portal");
+  tft.setCursor(10, 162); tft.print("Stays on (no auto off)");
 }
 
 static void startRuntimePortal() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("setup portal: WiFi not connected, not starting");
-    return;
-  }
+  // S3 v40 (user request): run the portal as our own access point,
+  // exactly like the first-time setup - the LAN-mode portal proved
+  // unreachable from the phone in the field. AP_STA keeps the station connection (and
+  // reception) alive alongside the AP.
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("APRSMap-Setup");
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  portalApMode = true;
   startConfigServer();
   beginMdns();
   runtimePortalActive = true;
   drawRuntimePortalScreen();
-  Serial.printf("setup portal: ON (http://aprs-map.local / http://%s)\n",
-                WiFi.localIP().toString().c_str());
+  Serial.println("setup portal: ON (AP 'APRSMap-Setup', http://192.168.4.1)");
 }
 
 static void stopRuntimePortal() {
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  portalApMode = false;
   stopConfigServer();
   endMdns();
   runtimePortalActive = false;
+  if (WiFi.status() != WL_CONNECTED)
+    WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());   // STA may not survive the mode switch
   fullRedraw = true;
   Serial.println("setup portal: OFF");
 }
@@ -4940,18 +5250,22 @@ static void runtimePortalLoop() {
     bootLowStartMs = 0;
     bootHandled = false;
   }
-  if (runtimePortalActive) {
-    if (WiFi.status() != WL_CONNECTED) stopRuntimePortal();
-    else if (now - portalLastActivityMs > 300000) {
-      Serial.println("setup portal: idle 5 min, auto off");
-      stopRuntimePortal();
-    }
-  }
+  // S3 v39: no idle auto-off (user request) - stays on until
+  // BOOT 2 s closes it. S3 v40: the WiFi-drop stop is gone too -
+  // in AP mode the portal is exactly what fixes a broken STA
+  // connection, so it must survive one.
 }
 
 // ---------------- setup / loop ----------------
 void setup() {
   Serial.begin(115200);
+#ifdef BUTTON_UI
+  pinMode(4, INPUT_PULLUP);
+  pinMode(5, INPUT_PULLUP);
+  pinMode(6, INPUT_PULLUP);
+  pinMode(7, INPUT_PULLUP);
+  Serial.println("UI: 4 buttons A=GPIO4 B=GPIO5 C=GPIO6 D=GPIO7 (no touch)");
+#endif
   // v162N: take the TLS reserve FIRST, while the heap is still
   // pristine. Taken at setup end (v130) it failed on this unit
   // ('tls reserve: FAILED') because the DMA pool was already
@@ -4971,7 +5285,13 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
+#if defined(LCD35)
+  tft.print("APRS Map Viewer S3 v40");
+#elif defined(BUTTON_UI)
+  tft.print("APRS Map Viewer S3 v29b");
+#else
   tft.print("APRS Map Viewer S3 v28");
+#endif
   // v77 diagnostic: show WHY the previous boot ended, on the splash
   // itself and on serial. The user saw occasional reboots on station
   // taps with NOTHING on the serial port; a panic or watchdog would
@@ -5087,12 +5407,12 @@ void setup() {
   // working point. Another 38,400 B back: compose in 4 bands.
   {
     if (!mapChunk2) {
-      mapChunk = (uint16_t*)heap_caps_malloc(320 * 60 * sizeof(uint16_t),
+      mapChunk = (uint16_t*)heap_caps_malloc(SCR_W * MAP_CHUNK_ROWS * sizeof(uint16_t),
                                              MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
       if (mapChunk) {
-        mapChunkRowsCap = 60;
+        mapChunkRowsCap = MAP_CHUNK_ROWS;
         mapChunkPermanent = true;
-        Serial.printf("frame buffer: permanent single 60 rows, largest DMA now %u\n",
+        Serial.printf("frame buffer: permanent single %d rows, largest DMA now %u\n", MAP_CHUNK_ROWS,
                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
       } else {
         Serial.printf("frame buffer: alloc FAILED (largest DMA %u) - dynamic fallback\n",
@@ -5107,10 +5427,15 @@ static uint32_t lastBarMs = 0, lastPurgeMs = 0, lastSdRetryMs = 0, lastStationRe
 static uint32_t lastMobileDrawMs = 0, lastMobileCheckMs = 0;
 void loop() {
   if (cfgServerRunning) cfgServer.handleClient();   // S3 v24: only while a portal is up
-  runtimePortalLoop();   // S3 v24: BOOT 2 s toggles the LAN portal
+  if (runtimePortalActive) dnsServer.processNextRequest();   // S3 v40: captive DNS for the AP portal
+  runtimePortalLoop();   // S3 v24: BOOT 2 s toggles the portal
   aprsLoop();
   if (runtimePortalActive) { delay(10); return; }   // portal screen stays up; reception continues
+#ifndef BUTTON_UI
   touchLoop();
+#else
+  buttonsLoop();
+#endif
   uint32_t now = millis();
   // S3 v15 (user idea): no ADS-B fetches while the FLIGHT screen
   // is not among the portal's selected screens.

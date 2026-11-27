@@ -4912,8 +4912,8 @@ static int readTouchConfirmed(int& mx, int& my) {
   if (!tft.getTouchRaw(&p, 1)) return 0;
   int32_t gx1, gy1;
   if (!tft.getTouch(&gx1, &gy1)) return 0;
-  int x1 = constrain(319 - (int)gx1, 0, 319);
-  int y1 = constrain((int)gy1, 0, 239);
+  int x1 = constrain((SCR_W - 1) - (int)gx1, 0, SCR_W - 1);
+  int y1 = constrain((int)gy1, 0, SCR_H - 1);
   delay(6);
   if (!tft.getTouchRaw(&q, 1)) return 2;
   int32_t gx2, gy2;
@@ -4929,8 +4929,8 @@ static int readTouchConfirmed(int& mx, int& my) {
   // x 200..3700, y 240..3800). Railed samples are not fingers.
   bool railed = p.x < 120 || p.x > 3980 || p.y < 120 || p.y > 3980 ||
                 q.x < 120 || q.x > 3980 || q.y < 120 || q.y > 3980;
-  int x2 = constrain(319 - (int)gx2, 0, 319);
-  int y2 = constrain((int)gy2, 0, 239);
+  int x2 = constrain((SCR_W - 1) - (int)gx2, 0, SCR_W - 1);
+  int y2 = constrain((int)gy2, 0, SCR_H - 1);
   if (railed || abs(x2 - x1) > 24 || abs(y2 - y1) > 24) {
     // v136: the phantom contact on the user's unit turned out to
     // be CONTINUOUS (z hovering at the threshold, irq held LOW),
@@ -5285,8 +5285,10 @@ void setup() {
   tft.setFont(&fonts::Font2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(10, 10);
-#if defined(LCD35)
+#if defined(LCD35) && defined(BUTTON_UI)
   tft.print("APRS Map Viewer S3 v40");
+#elif defined(LCD35)
+  tft.print("APRS Map Viewer S3 v40t");
 #elif defined(BUTTON_UI)
   tft.print("APRS Map Viewer S3 v29b");
 #else
